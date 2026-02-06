@@ -29,13 +29,13 @@ const pool = DATABASE_URL
 async function ensureTables() {
   if (!pool) return;
 
+  // Create base tables if missing (original)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS lists (
       id TEXT PRIMARY KEY,
       customer_id TEXT NOT NULL,
       name TEXT NOT NULL,
-      created_at BIGINT NOT NULL,
-      updated_at BIGINT NOT NULL
+      created_at BIGINT NOT NULL
     );
   `);
 
@@ -43,16 +43,40 @@ async function ensureTables() {
     CREATE TABLE IF NOT EXISTS list_items (
       id TEXT PRIMARY KEY,
       list_id TEXT NOT NULL,
-      sku TEXT NOT NULL,
+      variant_id TEXT NOT NULL,
       quantity INT NOT NULL
     );
   `);
 
-  // Helpful indexes
+  // --- Migrations (safe) ---
+
+  // Add updated_at if missing
+  await pool.query(`ALTER TABLE lists ADD COLUMN IF NOT EXISTS updated_at BIGINT;`);
+
+  // If list_items has variant_id but not sku, rename variant_id -> sku
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name='list_items' AND column_name='variant_id'
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name='list_items' AND column_name='sku'
+      ) THEN
+        ALTER TABLE list_items RENAME COLUMN variant_id TO sku;
+      END IF;
+    END $$;
+  `);
+
+  // If sku still doesn't exist for some reason, add it
+  await pool.query(`ALTER TABLE list_items ADD COLUMN IF NOT EXISTS sku TEXT;`);
+
+  // Indexes
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_lists_customer_id ON lists(customer_id);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_list_items_list_id ON list_items(list_id);`);
 }
-
 // Health
 app.get("/", (req, res) => res.send("OK"));
 
