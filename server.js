@@ -6,9 +6,7 @@ const { Pool } = pg;
 const app = express();
 
 /**
- * IMPORTANT:
- * - Shopify app proxy + frontend fetch works more reliably with URL-encoded POST
- * - So we enable BOTH json + urlencoded
+ * Support both JSON and URL-encoded (Shopify App Proxy is often happier with urlencoded).
  */
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: true }));
@@ -25,11 +23,13 @@ const pool = DATABASE_URL
     })
   : null;
 
-// Create tables
+/**
+ * Create tables + safe migrations (works if you created an earlier schema).
+ */
 async function ensureTables() {
   if (!pool) return;
 
-  // Create base tables if missing (original)
+  // Base create (lists)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS lists (
       id TEXT PRIMARY KEY,
@@ -39,49 +39,38 @@ async function ensureTables() {
     );
   `);
 
+  // Base create (list_items) - older schema may have variant_id
   await pool.query(`
     CREATE TABLE IF NOT EXISTS list_items (
       id TEXT PRIMARY KEY,
       list_id TEXT NOT NULL,
-      variant_id TEXT NOT NULL,
+      variant_id TEXT,
+      sku TEXT,
       quantity INT NOT NULL
     );
   `);
 
-  // --- Migrations (safe) ---
-
-  // Add updated_at if missing
+  // Migration: add updated_at to lists
   await pool.query(`ALTER TABLE lists ADD COLUMN IF NOT EXISTS updated_at BIGINT;`);
 
-  // If list_items has variant_id but not sku, rename variant_id -> sku
-  await pool.query(`
-    DO $$
-    BEGIN
-      IF EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_name='list_items' AND column_name='variant_id'
-      )
-      AND NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_name='list_items' AND column_name='sku'
-      ) THEN
-        ALTER TABLE list_items RENAME COLUMN variant_id TO sku;
-      END IF;
-    END $$;
-  `);
-
-  // If sku still doesn't exist for some reason, add it
+  // Migration: ensure sku column exists
   await pool.query(`ALTER TABLE list_items ADD COLUMN IF NOT EXISTS sku TEXT;`);
 
-  // Indexes
+  // Migration: if old schema used variant_id column but no sku data, keep variant_id and also allow sku.
+  // We'll store SKUs in sku going forward.
+
+  // Helpful indexes
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_lists_customer_id ON lists(customer_id);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_list_items_list_id ON list_items(list_id);`);
 }
+
 // Health
 app.get("/", (req, res) => res.send("OK"));
 
 /**
- * Helper: safe parse items from body (may arrive as JSON string via URL-encoded posts)
+ * Parse items from req.body.items
+ * - may be JSON string when sent via x-www-form-urlencoded
+ * - supports [{sku,quantity}] (from your modal)
  */
 function parseItems(req) {
   let items = req.body?.items;
@@ -96,7 +85,6 @@ function parseItems(req) {
 
   if (!Array.isArray(items)) items = [];
 
-  // normalize
   items = items
     .map((x) => ({
       sku: String(x?.sku || "").trim(),
@@ -106,127 +94,75 @@ function parseItems(req) {
 
   return items;
 }
-// ORDERIFY: resolve SKUs -> variant IDs (for cart adds)
-if (req.method === "GET" && action === "orderify") {
-  const list_id = String(req.query.list_id || "").trim();
-  if (!list_id) return res.status(400).json({ ok: false, error: "Missing list_id" });
 
+/**
+ * Admin GraphQL helper (for orderify)
+ */
+async function shopifyGql(query, variables) {
   const shop = process.env.SHOPIFY_SHOP_DOMAIN;
   const token = process.env.SHOPIFY_ADMIN_TOKEN;
+
   if (!shop || !token) {
-    return res.status(500).json({ ok:false, error:"Missing SHOPIFY_SHOP_DOMAIN or SHOPIFY_ADMIN_TOKEN" });
+    const err = new Error("Missing SHOPIFY_SHOP_DOMAIN or SHOPIFY_ADMIN_TOKEN");
+    err.code = "MISSING_SHOPIFY_ENV";
+    throw err;
   }
 
-  // Verify ownership
-  const { rows: listRows } = await pool.query(
-    `SELECT id FROM lists WHERE id=$1 AND customer_id=$2 LIMIT 1`,
-    [list_id, customer_id]
-  );
-  if (!listRows.length) return res.status(404).json({ ok:false, error:"List not found" });
+  const r = await fetch(`https://${shop}/admin/api/2025-01/graphql.json`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Shopify-Access-Token": token
+    },
+    body: JSON.stringify({ query, variables })
+  });
 
-  // Get SKUs + qty
-  const { rows: itemsRows } = await pool.query(
-    `SELECT sku, quantity FROM list_items WHERE list_id=$1`,
-    [list_id]
-  );
+  const j = await r.json();
 
-  // Resolve each SKU to a variant ID using Admin GraphQL
-  async function gql(query, variables){
-    const r = await fetch(`https://${shop}/admin/api/2025-01/graphql.json`, {
-      method:"POST",
-      headers:{
-        "Content-Type":"application/json",
-        "X-Shopify-Access-Token": token
-      },
-      body: JSON.stringify({ query, variables })
-    });
-    const j = await r.json();
-    if (j.errors) throw new Error(j.errors.map(e=>e.message).join("; "));
-    return j.data;
+  if (j.errors) {
+    const err = new Error(j.errors.map((e) => e.message).join("; "));
+    err.code = "SHOPIFY_GQL_ERROR";
+    throw err;
   }
 
-  const query = `
-    query VariantBySku($q: String!) {
-      productVariants(first: 1, query: $q) {
-        edges {
-          node { id sku availableForSale }
-        }
-      }
-    }
-  `;
-
-  const resolved = [];
-  const not_found = [];
-
-  for (const it of itemsRows) {
-    const sku = String(it.sku || "").trim();
-    const qty = parseInt(it.quantity || 0, 10);
-    if (!sku || qty < 1) continue;
-
-    const data = await gql(query, { q: `sku:${sku}` });
-    const edge = data?.productVariants?.edges?.[0];
-    const node = edge?.node;
-
-    if (!node?.id) {
-      not_found.push(sku);
-      continue;
-    }
-
-    // GraphQL gid -> numeric id for /cart/add.js
-    const gid = node.id; // "gid://shopify/ProductVariant/123"
-    const numeric = gid.split("/").pop();
-
-    resolved.push({
-      sku,
-      variant_id: numeric,
-      quantity: qty,
-      available: !!node.availableForSale
-    });
-  }
-
-  return res.json({ ok:true, items: resolved, not_found });
+  return j.data;
 }
 
 /**
- * Proxy route used by Shopify App Proxy:
- * /apps/b2b-lists/proxy?action=list&customer_id=123
- *
- * We'll support:
- * GET  /proxy?action=list&customer_id=...
- * GET  /proxy?action=get&customer_id=...&list_id=...
- * POST /proxy?action=upsert&customer_id=...   (urlencoded or json)
- * POST /proxy?action=delete&customer_id=...   (urlencoded or json)
- *
- * NOTE: In dev you can hit /proxy directly.
+ * App Proxy endpoint:
+ * /apps/b2b-lists/proxy -> Render mapped to /proxy
  */
 app.all("/proxy", async (req, res) => {
   try {
     const action = String(req.query.action || "").toLowerCase();
 
-    const customer_id =
-      String(req.query.customer_id || req.body?.customer_id || "").trim();
+    const customer_id = String(
+      req.query.customer_id || req.body?.customer_id || ""
+    ).trim();
 
     if (!customer_id) {
       return res.status(400).json({ ok: false, error: "Missing customer_id" });
     }
 
     if (!pool) {
-      // If DATABASE_URL isn't set, we can still respond (local/dev)
+      // Local mode without DB
       return res.json({ ok: true, lists: [] });
     }
 
-    // LIST
+    // ----------------------------
+    // LIST: GET action=list
+    // ----------------------------
     if (req.method === "GET" && action === "list") {
       const { rows } = await pool.query(
         `SELECT id, customer_id, name, created_at, updated_at
          FROM lists
          WHERE customer_id = $1
-         ORDER BY updated_at DESC
+         ORDER BY COALESCE(updated_at, created_at) DESC
          LIMIT 50`,
         [customer_id]
       );
 
-      // attach item counts
+      // attach item counts only (fast)
       const ids = rows.map((r) => r.id);
       let countsById = {};
       if (ids.length) {
@@ -244,32 +180,40 @@ app.all("/proxy", async (req, res) => {
         id: r.id,
         name: r.name,
         created_at: String(r.created_at),
-        updated_at: String(r.updated_at),
-        items: Array(countsById[r.id] || 0).fill(0) // frontend only needs length for "x items"
+        updated_at: String(r.updated_at || r.created_at),
+        // Your UI only needs length here; full items are fetched by action=get
+        items: Array(countsById[r.id] || 0).fill(0)
       }));
 
       return res.json({ ok: true, lists });
     }
 
-    // GET ONE (for editing)
+    // ----------------------------
+    // GET ONE: GET action=get&list_id=...
+    // returns list + items (with sku + quantity)
+    // ----------------------------
     if (req.method === "GET" && action === "get") {
       const list_id = String(req.query.list_id || "").trim();
-      if (!list_id) return res.status(400).json({ ok: false, error: "Missing list_id" });
+      if (!list_id) {
+        return res.status(400).json({ ok: false, error: "Missing list_id" });
+      }
 
       const { rows: listRows } = await pool.query(
         `SELECT id, customer_id, name, created_at, updated_at
          FROM lists
-         WHERE id = $1 AND customer_id = $2
+         WHERE id=$1 AND customer_id=$2
          LIMIT 1`,
         [list_id, customer_id]
       );
 
-      if (!listRows.length) return res.status(404).json({ ok: false, error: "List not found" });
+      if (!listRows.length) {
+        return res.status(404).json({ ok: false, error: "List not found" });
+      }
 
       const { rows: itemRows } = await pool.query(
         `SELECT sku, quantity
          FROM list_items
-         WHERE list_id = $1
+         WHERE list_id=$1
          ORDER BY sku ASC`,
         [list_id]
       );
@@ -280,13 +224,82 @@ app.all("/proxy", async (req, res) => {
           id: listRows[0].id,
           name: listRows[0].name,
           created_at: String(listRows[0].created_at),
-          updated_at: String(listRows[0].updated_at),
-          items: itemRows
+          updated_at: String(listRows[0].updated_at || listRows[0].created_at),
+          items: itemRows.map((r) => ({
+            sku: r.sku,
+            quantity: parseInt(r.quantity || 1, 10)
+          }))
         }
       });
     }
 
-    // UPSERT (create or update)
+    // ----------------------------
+    // ORDERIFY: GET action=orderify&list_id=...
+    // returns variant_id + quantity (ready for /cart/add.js)
+    // ----------------------------
+    if (req.method === "GET" && action === "orderify") {
+      const list_id = String(req.query.list_id || "").trim();
+      if (!list_id) {
+        return res.status(400).json({ ok: false, error: "Missing list_id" });
+      }
+
+      // ownership check
+      const { rows: listRows } = await pool.query(
+        `SELECT id FROM lists WHERE id=$1 AND customer_id=$2 LIMIT 1`,
+        [list_id, customer_id]
+      );
+
+      if (!listRows.length) {
+        return res.status(404).json({ ok: false, error: "List not found" });
+      }
+
+      // get sku+qty from DB
+      const { rows: itemsRows } = await pool.query(
+        `SELECT sku, quantity FROM list_items WHERE list_id=$1`,
+        [list_id]
+      );
+
+      const QUERY = `
+        query VariantBySku($q: String!) {
+          productVariants(first: 1, query: $q) {
+            edges { node { id sku availableForSale } }
+          }
+        }
+      `;
+
+      const resolved = [];
+      const not_found = [];
+
+      for (const it of itemsRows) {
+        const sku = String(it.sku || "").trim();
+        const qty = parseInt(it.quantity || 0, 10);
+        if (!sku || qty < 1) continue;
+
+        const data = await shopifyGql(QUERY, { q: `sku:${sku}` });
+        const node = data?.productVariants?.edges?.[0]?.node;
+
+        if (!node?.id) {
+          not_found.push(sku);
+          continue;
+        }
+
+        const numericId = String(node.id).split("/").pop(); // gid -> numeric
+        resolved.push({
+          sku,
+          variant_id: numericId,
+          quantity: qty,
+          available: !!node.availableForSale
+        });
+      }
+
+      return res.json({ ok: true, items: resolved, not_found });
+    }
+
+    // ----------------------------
+    // UPSERT: POST action=upsert
+    // body: customer_id, list_id(optional), name, items(JSON string or array)
+    // stores SKUs + qty in DB (your modal uses sku)
+    // ----------------------------
     if (req.method === "POST" && action === "upsert") {
       const list_id = String(req.body?.list_id || "").trim(); // optional
       const name = String(req.body?.name || "").trim();
@@ -298,7 +311,7 @@ app.all("/proxy", async (req, res) => {
       const now = Date.now();
       const id = list_id || crypto.randomUUID();
 
-      // If list exists, ensure it belongs to customer
+      // check existing ownership
       const { rows: existing } = await pool.query(
         `SELECT id FROM lists WHERE id=$1 AND customer_id=$2 LIMIT 1`,
         [id, customer_id]
@@ -309,7 +322,6 @@ app.all("/proxy", async (req, res) => {
           `UPDATE lists SET name=$1, updated_at=$2 WHERE id=$3 AND customer_id=$4`,
           [name, now, id, customer_id]
         );
-        // wipe old items
         await pool.query(`DELETE FROM list_items WHERE list_id=$1`, [id]);
       } else {
         await pool.query(
@@ -319,7 +331,7 @@ app.all("/proxy", async (req, res) => {
         );
       }
 
-      // insert items (store SKU + qty)
+      // insert items (SKU + quantity)
       for (const it of items) {
         await pool.query(
           `INSERT INTO list_items (id, list_id, sku, quantity)
@@ -328,15 +340,20 @@ app.all("/proxy", async (req, res) => {
         );
       }
 
+      // We only validate SKU existence during orderify (Admin API),
+      // so keep not_found empty here.
       return res.json({ ok: true, list_id: id, not_found: [] });
     }
 
-    // DELETE
+    // ----------------------------
+    // DELETE: POST action=delete
+    // body: customer_id, list_id
+    // ----------------------------
     if (req.method === "POST" && action === "delete") {
       const list_id = String(req.body?.list_id || "").trim();
       if (!list_id) return res.status(400).json({ ok: false, error: "Missing list_id" });
 
-      // Only delete if owned by customer
+      // delete only if owned by customer
       await pool.query(`DELETE FROM list_items WHERE list_id=$1`, [list_id]);
       await pool.query(`DELETE FROM lists WHERE id=$1 AND customer_id=$2`, [list_id, customer_id]);
 
