@@ -108,7 +108,9 @@ async function shopifyGql(query, variables) {
     throw err;
   }
 
-  const r = await fetch(`https://${shop}/admin/api/2025-01/graphql.json`, {
+  const url = `https://${shop}/admin/api/2025-01/graphql.json`;
+
+  const r = await fetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -117,13 +119,48 @@ async function shopifyGql(query, variables) {
     body: JSON.stringify({ query, variables })
   });
 
-  const j = await r.json();
+  const text = await r.text();
 
-  if (j.errors) {
-    const err = new Error(j.errors.map((e) => e.message).join("; "));
+  let j;
+  try {
+    j = JSON.parse(text);
+  } catch (e) {
+    // Shopify (or a proxy) returned non-JSON (often HTML login/blocked page)
+    const err = new Error(`Shopify returned non-JSON (status ${r.status}). First 200 chars: ${text.slice(0, 200)}`);
+    err.code = "SHOPIFY_NON_JSON";
+    throw err;
+  }
+
+  // Handle HTTP-level errors + messages
+  if (!r.ok) {
+    const msg =
+      (j && (j.error_description || j.error || j.message)) ||
+      `Shopify HTTP ${r.status}`;
+    const err = new Error(msg);
+    err.code = "SHOPIFY_HTTP_ERROR";
+    throw err;
+  }
+
+  // Handle GraphQL errors in any shape
+  if (j && j.errors) {
+    let msg = "";
+
+    if (Array.isArray(j.errors)) {
+      msg = j.errors.map(e => e.message || JSON.stringify(e)).join("; ");
+    } else if (typeof j.errors === "string") {
+      msg = j.errors;
+    } else {
+      msg = JSON.stringify(j.errors);
+    }
+
+    const err = new Error(msg || "Shopify GraphQL error");
     err.code = "SHOPIFY_GQL_ERROR";
     throw err;
   }
+
+  // Shopify can also return userErrors under data; caller checks those if needed.
+  return j.data;
+}
 
   return j.data;
 }
