@@ -398,6 +398,9 @@ const PORT = process.env.PORT || 3000;
 function start() {
   app.listen(PORT, () => console.log("Server running on port " + PORT));
 }
+app.get("/proxy-ping", (req, res) => {
+  res.json({ ok: true, ping: "from-render" });
+});
 
 if (!DATABASE_URL) {
   console.log("DATABASE_URL not set — running without DB (local dev mode).");
