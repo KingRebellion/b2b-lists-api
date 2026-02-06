@@ -5,30 +5,21 @@ import pg from "pg";
 const { Pool } = pg;
 const app = express();
 
-/**
- * ✅ MUST HAVE:
- * - JSON for any JSON posts
- * - URL-encoded for Shopify App Proxy posts (your modal uses this)
- */
-app.use(express.json({ limit: "2mb" }));
-app.use(express.urlencoded({ extended: true })); // ✅ FIXES YOUR 500 on upsert
+// IMPORTANT: App Proxy often posts as x-www-form-urlencoded
+app.use(express.urlencoded({ extended: false, limit: "1mb" }));
+app.use(express.json({ limit: "1mb" }));
 
-// -------------------- ENV --------------------
+// ENV
 const DATABASE_URL = process.env.DATABASE_URL || "";
-const SHOPIFY_ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN || ""; // Admin API access token
-const SHOPIFY_SHOP_DOMAIN = process.env.SHOPIFY_SHOP_DOMAIN || ""; // ex: mississauga-hardware-wholesale.myshopify.com
-const SHOPIFY_API_SECRET = process.env.SHOPIFY_API_SECRET || "";   // App proxy signature secret (optional but recommended)
 
-const pool = DATABASE_URL
-  ? new Pool({
-      connectionString: DATABASE_URL,
-      ssl: DATABASE_URL.includes("render.com") ? { rejectUnauthorized: false } : false,
-    })
-  : null;
+// Postgres
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: DATABASE_URL.includes("render.com") ? { rejectUnauthorized: false } : false,
+});
 
-// -------------------- DB INIT --------------------
+// ---------- DB ----------
 async function ensureTables() {
-  // lists: one per customer
   await pool.query(`
     CREATE TABLE IF NOT EXISTS lists (
       id TEXT PRIMARY KEY,
@@ -38,7 +29,7 @@ async function ensureTables() {
     );
   `);
 
-  // list_items: store SKU + quantity (not variant_id) so we can re-resolve later
+  // Store SKU + qty (NOT variant_id) so we don't need Admin API
   await pool.query(`
     CREATE TABLE IF NOT EXISTS list_items (
       id TEXT PRIMARY KEY,
@@ -46,438 +37,262 @@ async function ensureTables() {
       sku TEXT NOT NULL,
       quantity INT NOT NULL,
       position INT NOT NULL,
-      CONSTRAINT fk_list
-        FOREIGN KEY(list_id)
-        REFERENCES lists(id)
-        ON DELETE CASCADE
+      CONSTRAINT fk_list FOREIGN KEY(list_id) REFERENCES lists(id) ON DELETE CASCADE
     );
   `);
 
-  // Helpful index
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS idx_lists_customer_id ON lists(customer_id);
-  `);
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS idx_list_items_list_id ON list_items(list_id);
-  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_lists_customer ON lists(customer_id);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_items_list ON list_items(list_id);`);
 }
 
 function nowMs() {
   return Date.now();
 }
-
-function uid() {
-  return crypto.randomBytes(16).toString("hex");
+function uid(prefix = "") {
+  return prefix + crypto.randomBytes(16).toString("hex");
 }
 
-// -------------------- OPTIONAL: Verify App Proxy Signature --------------------
-/**
- * Shopify App Proxy adds a "signature" query param.
- * You can validate it using your App Proxy secret.
- *
- * If SHOPIFY_API_SECRET is not set, we skip validation.
- * (That’s OK during dev, but set it for production.)
- */
-function verifyProxySignature(req) {
-  if (!SHOPIFY_API_SECRET) return true;
-
-  const q = { ...(req.query || {}) };
-
-  // Shopify uses "signature"
-  const provided = q.signature;
-  if (!provided) return false;
-
-  // Remove signature from message
-  delete q.signature;
-
-  // Build message: sort keys, concatenate key=value
-  const message = Object.keys(q)
-    .sort()
-    .map((k) => `${k}=${q[k]}`)
-    .join("");
-
-  const digest = crypto
-    .createHmac("sha256", SHOPIFY_API_SECRET)
-    .update(message)
-    .digest("hex");
-
-  return digest === provided;
-}
-
-// -------------------- Shopify Admin GraphQL --------------------
-async function shopifyGql(query, variables = {}) {
-  if (!SHOPIFY_SHOP_DOMAIN || !SHOPIFY_ADMIN_TOKEN) {
-    throw new Error("Missing SHOPIFY_SHOP_DOMAIN or SHOPIFY_ADMIN_TOKEN in env.");
-  }
-
-  const url = `https://${SHOPIFY_SHOP_DOMAIN}/admin/api/2025-01/graphql.json`;
-
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN,
-    },
-    body: JSON.stringify({ query, variables }),
-  });
-
-  const text = await resp.text();
-
-  let json;
-  try {
-    json = JSON.parse(text);
-  } catch {
-    throw new Error(`Shopify GraphQL non-JSON (${resp.status}): ${text.slice(0, 200)}`);
-  }
-
-  // Handle top-level errors (array)
-  if (Array.isArray(json.errors) && json.errors.length) {
-    const msg = json.errors.map((e) => e.message).join("; ");
-    throw new Error(`Shopify GraphQL errors: ${msg}`);
-  }
-
-  // Some responses include userErrors inside data; caller checks
-  return json;
-}
-
-/**
- * Resolve SKUs -> variant ids via GraphQL.
- * This uses a variant query by SKU (search query).
- */
-async function resolveSkusToVariants(skus = []) {
-  // Deduplicate + sanitize
-  const cleaned = Array.from(
-    new Set(
-      skus
-        .map((s) => String(s || "").trim())
-        .filter(Boolean)
-        .map((s) => s.toUpperCase())
-    )
-  );
-
-  if (!cleaned.length) return { found: new Map(), notFound: [] };
-
-  // We’ll query each sku individually (simple + reliable)
-  const found = new Map();
-  const notFound = [];
-
-  const Q = `
-    query VariantBySku($q: String!) {
-      productVariants(first: 5, query: $q) {
-        edges {
-          node {
-            id
-            sku
-            title
-            product { title }
-          }
-        }
-      }
-    }
-  `;
-
-  for (const sku of cleaned) {
-    const q = `sku:${sku}`;
-    try {
-      const j = await shopifyGql(Q, { q });
-
-      const edges = j?.data?.productVariants?.edges || [];
-      if (!edges.length) {
-        notFound.push(sku);
-        continue;
-      }
-
-      // pick exact SKU match if present
-      let exact = edges.find((e) => (e?.node?.sku || "").toUpperCase() === sku);
-      if (!exact) exact = edges[0];
-
-      const node = exact?.node;
-      if (!node?.id) {
-        notFound.push(sku);
-        continue;
-      }
-
-      // Shopify GraphQL IDs are gid://shopify/ProductVariant/123...
-      const variantIdNum = String(node.id).split("/").pop();
-      found.set(sku, {
-        variant_id: variantIdNum,
-        sku: node.sku || sku,
-        title: `${node.product?.title || ""}${node.title ? " — " + node.title : ""}`.trim(),
-      });
-    } catch (e) {
-      // If Shopify errors, treat as not found for this sku but continue
-      notFound.push(sku);
-    }
-  }
-
-  return { found, notFound };
-}
-
-// -------------------- Helpers --------------------
-function ok(res, payload = {}) {
+function ok(res, data = {}) {
   res.set("Content-Type", "application/json; charset=utf-8");
-  res.status(200).send(JSON.stringify({ ok: true, ...payload }));
+  res.status(200).send(JSON.stringify({ ok: true, ...data }));
 }
-
-function fail(res, status = 400, message = "Bad request", extra = {}) {
+function fail(res, code = 400, message = "Bad request") {
   res.set("Content-Type", "application/json; charset=utf-8");
-  res.status(status).send(JSON.stringify({ ok: false, error: message, ...extra }));
+  res.status(code).send(JSON.stringify({ ok: false, error: message }));
 }
 
-function getAction(req) {
-  return String(req.query?.action || "").toLowerCase().trim();
-}
+// Normalize items coming from urlencoded forms
+function parseItemsFromBody(req) {
+  let items = req.body?.items;
 
-function getCustomerId(req) {
-  // can come from query or body (your liquid includes both)
-  return String(req.query?.customer_id || req.body?.customer_id || "").trim();
-}
-
-function normalizeItems(rawItems) {
-  // rawItems may be an array or a JSON string from URL-encoded posts
-  let items = rawItems;
-
+  // items might be a JSON string (because we send URLSearchParams)
   if (typeof items === "string") {
     try {
       items = JSON.parse(items);
-    } catch {
+    } catch (e) {
       items = [];
     }
   }
 
-  items = Array.isArray(items) ? items : [];
+  if (!Array.isArray(items)) items = [];
 
-  // Normalize each row: { sku, quantity }
-  const cleaned = items
-    .map((it, idx) => {
-      const sku = String(it?.sku || "").trim().toUpperCase();
-      let quantity = parseInt(String(it?.quantity ?? it?.qty ?? "1"), 10);
-      if (!Number.isFinite(quantity) || quantity < 1) quantity = 1;
-      return { sku, quantity, position: idx + 1 };
-    })
-    .filter((x) => x.sku);
-
-  // Merge duplicate SKUs
-  const merged = new Map();
-  for (const it of cleaned) {
-    if (!merged.has(it.sku)) merged.set(it.sku, { sku: it.sku, quantity: 0, position: it.position });
-    merged.get(it.sku).quantity += it.quantity;
+  // Keep only valid rows
+  const cleaned = [];
+  for (const it of items) {
+    const sku = String(it?.sku || "").trim();
+    let quantity = parseInt(it?.quantity, 10);
+    if (!sku) continue;
+    if (!quantity || quantity < 1) quantity = 1;
+    cleaned.push({ sku, quantity });
   }
 
-  return Array.from(merged.values());
+  // Merge duplicates by SKU (case-insensitive)
+  const merged = new Map();
+  for (const it of cleaned) {
+    const key = it.sku.toUpperCase();
+    merged.set(key, (merged.get(key) || 0) + it.quantity);
+  }
+
+  return Array.from(merged.entries()).map(([sku, quantity], i) => ({
+    sku,
+    quantity,
+    position: i + 1,
+  }));
 }
 
-// -------------------- Health --------------------
+// ---------- ROUTES ----------
 app.get("/", (req, res) => res.send("OK"));
 
-// -------------------- APP PROXY ROUTE --------------------
+// (Optional) quick health for debugging
+app.get("/proxy-ping", (req, res) => ok(res, { pong: true }));
+
 /**
- * Your proxy URL in Shopify should point to:
- *   https://b2b-lists-api.onrender.com/proxy
- *
- * Shopify storefront calls:
- *   /apps/b2b-lists/proxy?action=...
- * Shopify forwards it to /proxy on Render.
+ * Shopify App Proxy endpoint
+ * Your app proxy points to: /proxy  (or whatever you set)
+ * Storefront calls: /apps/b2b-lists/proxy?action=...
  */
 app.all("/proxy", async (req, res) => {
   try {
-    // Optional signature validation
-    if (!verifyProxySignature(req)) {
-      return fail(res, 401, "Invalid proxy signature.");
-    }
+    const action = String(req.query?.action || "").toLowerCase();
 
-    // If DB not configured
-    if (!pool) {
-      const action = getAction(req);
-      if (action === "list") return ok(res, { lists: [] });
-      return fail(res, 500, "DATABASE_URL not set on server.");
-    }
+    // App proxy will be called like:
+    // /apps/b2b-lists/proxy?action=list&customer_id=123
+    const customer_id = String(req.query?.customer_id || req.body?.customer_id || "").trim();
 
-    const action = getAction(req);
-    const customerId = getCustomerId(req);
+    if (!action) return fail(res, 400, "Missing action");
+    if (!customer_id && action !== "ping") return fail(res, 400, "Missing customer_id");
 
-    if (!action) return fail(res, 400, "Missing action.");
-    if (!customerId) return fail(res, 400, "Missing customer_id.");
-
-    // ---------- LIST ----------
+    // ---- LIST ----
     if (action === "list" && req.method === "GET") {
       const { rows: lists } = await pool.query(
         `SELECT id, customer_id, name, updated_at
          FROM lists
-         WHERE customer_id = $1
+         WHERE customer_id=$1
          ORDER BY updated_at DESC`,
-        [customerId]
+        [customer_id]
       );
 
-      // attach item counts quickly
-      const ids = lists.map((l) => l.id);
-      let countsById = new Map();
-      if (ids.length) {
-        const { rows: counts } = await pool.query(
-          `SELECT list_id, COUNT(*)::int AS cnt
-           FROM list_items
-           WHERE list_id = ANY($1)
-           GROUP BY list_id`,
-          [ids]
+      // Attach item counts
+      const out = [];
+      for (const l of lists) {
+        const { rows: cnt } = await pool.query(
+          `SELECT COUNT(*)::int AS c FROM list_items WHERE list_id=$1`,
+          [l.id]
         );
-        counts.forEach((c) => countsById.set(c.list_id, c.cnt));
+        out.push({
+          id: l.id,
+          customer_id: l.customer_id,
+          name: l.name,
+          updated_at: l.updated_at,
+          items_count: cnt?.[0]?.c || 0,
+        });
       }
 
-      const shaped = lists.map((l) => ({
-        id: l.id,
-        customer_id: l.customer_id,
-        name: l.name,
-        updated_at: l.updated_at,
-        items: new Array(countsById.get(l.id) || 0).fill({}), // keeps your UI meta stable
-        item_count: countsById.get(l.id) || 0,
-      }));
-
-      return ok(res, { lists: shaped });
+      return ok(res, { lists: out });
     }
 
-    // ---------- GET (full list with items) ----------
+    // ---- GET ----
     if (action === "get" && req.method === "GET") {
-      const listId = String(req.query?.list_id || "").trim();
-      if (!listId) return fail(res, 400, "Missing list_id.");
+      const list_id = String(req.query?.list_id || "").trim();
+      if (!list_id) return fail(res, 400, "Missing list_id");
 
-      const { rows: listRows } = await pool.query(
+      const { rows: lrows } = await pool.query(
         `SELECT id, customer_id, name, updated_at
          FROM lists
-         WHERE id = $1 AND customer_id = $2`,
-        [listId, customerId]
+         WHERE id=$1 AND customer_id=$2
+         LIMIT 1`,
+        [list_id, customer_id]
       );
-      if (!listRows.length) return fail(res, 404, "List not found.");
+      if (!lrows.length) return fail(res, 404, "List not found");
 
-      const { rows: itemRows } = await pool.query(
+      const { rows: irows } = await pool.query(
         `SELECT sku, quantity, position
          FROM list_items
-         WHERE list_id = $1
+         WHERE list_id=$1
          ORDER BY position ASC`,
-        [listId]
+        [list_id]
       );
 
       return ok(res, {
         list: {
-          ...listRows[0],
-          items: itemRows.map((r) => ({ sku: r.sku, quantity: r.quantity })),
+          id: lrows[0].id,
+          customer_id: lrows[0].customer_id,
+          name: lrows[0].name,
+          updated_at: lrows[0].updated_at,
+          items: irows.map((r) => ({ sku: r.sku, quantity: r.quantity })),
         },
       });
     }
 
-    // ---------- UPSERT (create or update) ----------
+    // ---- UPSERT (create or update) ----
+    // Your storefront JS calls POST with urlencoded params
     if (action === "upsert" && req.method === "POST") {
-      const listIdIncoming = String(req.body?.list_id || req.query?.list_id || "").trim();
+      const list_id_in = String(req.body?.list_id || "").trim();
       const name = String(req.body?.name || "").trim();
-      const items = normalizeItems(req.body?.items);
 
-      if (!name) return fail(res, 400, "Missing name.");
-      if (!items.length) return fail(res, 400, "No items provided.");
+      if (!name) return fail(res, 400, "Missing name");
 
-      const listId = listIdIncoming || uid();
-      const ts = nowMs();
+      const items = parseItemsFromBody(req);
+      if (!items.length) return fail(res, 400, "No items");
 
-      // Ensure list row
+      const list_id = list_id_in || uid("list_");
+      const updated_at = nowMs();
+
+      // Upsert list
       await pool.query(
-        `INSERT INTO lists (id, customer_id, name, updated_at)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT (id) DO UPDATE SET
-           name = EXCLUDED.name,
-           updated_at = EXCLUDED.updated_at
-         WHERE lists.customer_id = $2`,
-        [listId, customerId, name, ts]
+        `
+        INSERT INTO lists (id, customer_id, name, updated_at)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (id) DO UPDATE
+          SET name=EXCLUDED.name,
+              updated_at=EXCLUDED.updated_at
+        `,
+        [list_id, customer_id, name, updated_at]
       );
 
-      // Replace items (simple + reliable)
-      await pool.query(`DELETE FROM list_items WHERE list_id = $1`, [listId]);
+      // Replace items
+      await pool.query(`DELETE FROM list_items WHERE list_id=$1`, [list_id]);
 
-      // Insert items
       for (const it of items) {
         await pool.query(
-          `INSERT INTO list_items (id, list_id, sku, quantity, position)
-           VALUES ($1, $2, $3, $4, $5)`,
-          [uid(), listId, it.sku, it.quantity, it.position]
+          `
+          INSERT INTO list_items (id, list_id, sku, quantity, position)
+          VALUES ($1, $2, $3, $4, $5)
+          `,
+          [uid("itm_"), list_id, it.sku, it.quantity, it.position]
         );
       }
 
-      return ok(res, { list_id: listId });
+      return ok(res, {
+        list_id,
+        updated_at,
+        items_saved: items.length,
+      });
     }
 
-    // ---------- DELETE ----------
+    // ---- DELETE ----
     if (action === "delete" && req.method === "POST") {
-      const listId = String(req.body?.list_id || req.query?.list_id || "").trim();
-      if (!listId) return fail(res, 400, "Missing list_id.");
+      const list_id = String(req.body?.list_id || req.query?.list_id || "").trim();
+      if (!list_id) return fail(res, 400, "Missing list_id");
 
-      // Only delete if belongs to this customer
-      const r = await pool.query(
-        `DELETE FROM lists WHERE id = $1 AND customer_id = $2`,
-        [listId, customerId]
+      // Ensure ownership
+      const { rows: owned } = await pool.query(
+        `SELECT id FROM lists WHERE id=$1 AND customer_id=$2 LIMIT 1`,
+        [list_id, customer_id]
       );
+      if (!owned.length) return fail(res, 404, "List not found");
 
-      if (r.rowCount === 0) return fail(res, 404, "List not found.");
-      return ok(res, {});
+      await pool.query(`DELETE FROM lists WHERE id=$1 AND customer_id=$2`, [list_id, customer_id]);
+      return ok(res, { deleted: true });
     }
 
-    // ---------- ORDERIFY (convert saved SKUs -> variant ids) ----------
+    // ---- ORDERIFY ----
+    // Returns SKUs+qty for the list so the storefront can resolve and add to cart
     if (action === "orderify" && req.method === "GET") {
-      const listId = String(req.query?.list_id || "").trim();
-      if (!listId) return fail(res, 400, "Missing list_id.");
+      const list_id = String(req.query?.list_id || "").trim();
+      if (!list_id) return fail(res, 400, "Missing list_id");
 
-      const { rows: listRows } = await pool.query(
-        `SELECT id FROM lists WHERE id = $1 AND customer_id = $2`,
-        [listId, customerId]
+      const { rows: lrows } = await pool.query(
+        `SELECT id FROM lists WHERE id=$1 AND customer_id=$2 LIMIT 1`,
+        [list_id, customer_id]
       );
-      if (!listRows.length) return fail(res, 404, "List not found.");
+      if (!lrows.length) return fail(res, 404, "List not found");
 
-      const { rows: itemRows } = await pool.query(
+      const { rows: irows } = await pool.query(
         `SELECT sku, quantity
          FROM list_items
-         WHERE list_id = $1
+         WHERE list_id=$1
          ORDER BY position ASC`,
-        [listId]
+        [list_id]
       );
 
-      const skus = itemRows.map((r) => r.sku);
-      const { found, notFound } = await resolveSkusToVariants(skus);
-
-      const items = [];
-      for (const row of itemRows) {
-        const hit = found.get(String(row.sku).toUpperCase());
-        if (!hit) continue;
-        items.push({
-          sku: row.sku,
-          quantity: row.quantity,
-          variant_id: hit.variant_id,
-          title: hit.title,
-        });
-      }
-
-      return ok(res, { items, not_found: notFound });
+      return ok(res, {
+        list_id,
+        items: irows.map((r) => ({ sku: r.sku, quantity: r.quantity })),
+      });
     }
 
-    // Anything else
     return fail(res, 400, `Unsupported action/method. action=${action} method=${req.method}`);
   } catch (err) {
-    // IMPORTANT: return JSON (so your Liquid doesn't get HTML)
     console.error("Proxy error:", err);
-    return fail(res, 500, "Server error", { detail: String(err?.message || err) });
+    return fail(res, 500, "Server error");
   }
 });
 
-// -------------------- START --------------------
+// ---------- START ----------
 const PORT = process.env.PORT || 3000;
 
 async function start() {
+  if (!DATABASE_URL) {
+    console.log("DATABASE_URL not set — cannot run without DB.");
+    process.exit(1);
+  }
+
+  await ensureTables();
   app.listen(PORT, () => console.log("Server running on port " + PORT));
 }
 
-if (!pool) {
-  console.log("DATABASE_URL not set — running without DB.");
-  start();
-} else {
-  ensureTables()
-    .then(start)
-    .catch((err) => {
-      console.error("DB init failed:", err);
-      process.exit(1);
-    });
-}
+start().catch((err) => {
+  console.error("Startup failed:", err);
+  process.exit(1);
+});
