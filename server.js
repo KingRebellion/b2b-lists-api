@@ -106,6 +106,86 @@ function parseItems(req) {
 
   return items;
 }
+// ORDERIFY: resolve SKUs -> variant IDs (for cart adds)
+if (req.method === "GET" && action === "orderify") {
+  const list_id = String(req.query.list_id || "").trim();
+  if (!list_id) return res.status(400).json({ ok: false, error: "Missing list_id" });
+
+  const shop = process.env.SHOPIFY_SHOP_DOMAIN;
+  const token = process.env.SHOPIFY_ADMIN_TOKEN;
+  if (!shop || !token) {
+    return res.status(500).json({ ok:false, error:"Missing SHOPIFY_SHOP_DOMAIN or SHOPIFY_ADMIN_TOKEN" });
+  }
+
+  // Verify ownership
+  const { rows: listRows } = await pool.query(
+    `SELECT id FROM lists WHERE id=$1 AND customer_id=$2 LIMIT 1`,
+    [list_id, customer_id]
+  );
+  if (!listRows.length) return res.status(404).json({ ok:false, error:"List not found" });
+
+  // Get SKUs + qty
+  const { rows: itemsRows } = await pool.query(
+    `SELECT sku, quantity FROM list_items WHERE list_id=$1`,
+    [list_id]
+  );
+
+  // Resolve each SKU to a variant ID using Admin GraphQL
+  async function gql(query, variables){
+    const r = await fetch(`https://${shop}/admin/api/2025-01/graphql.json`, {
+      method:"POST",
+      headers:{
+        "Content-Type":"application/json",
+        "X-Shopify-Access-Token": token
+      },
+      body: JSON.stringify({ query, variables })
+    });
+    const j = await r.json();
+    if (j.errors) throw new Error(j.errors.map(e=>e.message).join("; "));
+    return j.data;
+  }
+
+  const query = `
+    query VariantBySku($q: String!) {
+      productVariants(first: 1, query: $q) {
+        edges {
+          node { id sku availableForSale }
+        }
+      }
+    }
+  `;
+
+  const resolved = [];
+  const not_found = [];
+
+  for (const it of itemsRows) {
+    const sku = String(it.sku || "").trim();
+    const qty = parseInt(it.quantity || 0, 10);
+    if (!sku || qty < 1) continue;
+
+    const data = await gql(query, { q: `sku:${sku}` });
+    const edge = data?.productVariants?.edges?.[0];
+    const node = edge?.node;
+
+    if (!node?.id) {
+      not_found.push(sku);
+      continue;
+    }
+
+    // GraphQL gid -> numeric id for /cart/add.js
+    const gid = node.id; // "gid://shopify/ProductVariant/123"
+    const numeric = gid.split("/").pop();
+
+    resolved.push({
+      sku,
+      variant_id: numeric,
+      quantity: qty,
+      available: !!node.availableForSale
+    });
+  }
+
+  return res.json({ ok:true, items: resolved, not_found });
+}
 
 /**
  * Proxy route used by Shopify App Proxy:
