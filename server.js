@@ -6,201 +6,164 @@ const { Pool } = pg;
 const app = express();
 
 /**
- * IMPORTANT:
- * - App Proxy POSTs often arrive as x-www-form-urlencoded.
- * - We support both JSON and URL-encoded.
+ * ✅ MUST HAVE:
+ * - JSON for any JSON posts
+ * - URL-encoded for Shopify App Proxy posts (your modal uses this)
  */
-app.use(express.json({ limit: "1mb" }));
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: "2mb" }));
+app.use(express.urlencoded({ extended: true })); // ✅ FIXES YOUR 500 on upsert
 
 // -------------------- ENV --------------------
 const DATABASE_URL = process.env.DATABASE_URL || "";
+const SHOPIFY_ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN || ""; // Admin API access token
+const SHOPIFY_SHOP_DOMAIN = process.env.SHOPIFY_SHOP_DOMAIN || ""; // ex: mississauga-hardware-wholesale.myshopify.com
+const SHOPIFY_API_SECRET = process.env.SHOPIFY_API_SECRET || "";   // App proxy signature secret (optional but recommended)
 
-const SHOP_DOMAIN = (process.env.SHOPIFY_SHOP_DOMAIN || "").trim(); // mississauga-hardware-wholesale.myshopify.com
-const SHOPIFY_CLIENT_ID = (process.env.SHOPIFY_CLIENT_ID || "").trim();
-const SHOPIFY_CLIENT_SECRET = (process.env.SHOPIFY_CLIENT_SECRET || "").trim();
-const SHOPIFY_API_VERSION = (process.env.SHOPIFY_API_VERSION || "2025-01").trim();
-const VERIFY_PROXY = String(process.env.VERIFY_PROXY || "false").toLowerCase() === "true";
+const pool = DATABASE_URL
+  ? new Pool({
+      connectionString: DATABASE_URL,
+      ssl: DATABASE_URL.includes("render.com") ? { rejectUnauthorized: false } : false,
+    })
+  : null;
 
-// -------------------- DB --------------------
-const pool = new Pool({
-  connectionString: DATABASE_URL,
-  ssl: DATABASE_URL && DATABASE_URL.includes("render.com")
-    ? { rejectUnauthorized: false }
-    : false,
-});
-
+// -------------------- DB INIT --------------------
 async function ensureTables() {
+  // lists: one per customer
   await pool.query(`
     CREATE TABLE IF NOT EXISTS lists (
       id TEXT PRIMARY KEY,
       customer_id TEXT NOT NULL,
       name TEXT NOT NULL,
-      created_at BIGINT NOT NULL,
       updated_at BIGINT NOT NULL
     );
   `);
 
+  // list_items: store SKU + quantity (not variant_id) so we can re-resolve later
   await pool.query(`
     CREATE TABLE IF NOT EXISTS list_items (
       id TEXT PRIMARY KEY,
       list_id TEXT NOT NULL,
-      sku TEXT,
-      variant_id TEXT NOT NULL,
+      sku TEXT NOT NULL,
       quantity INT NOT NULL,
-      position INT NOT NULL
+      position INT NOT NULL,
+      CONSTRAINT fk_list
+        FOREIGN KEY(list_id)
+        REFERENCES lists(id)
+        ON DELETE CASCADE
     );
   `);
 
-  // Helpful indexes
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_lists_customer ON lists(customer_id);`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_items_list ON list_items(list_id);`);
+  // Helpful index
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_lists_customer_id ON lists(customer_id);
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_list_items_list_id ON list_items(list_id);
+  `);
 }
 
-// -------------------- Utilities --------------------
 function nowMs() {
   return Date.now();
 }
 
-function jsonOk(res, payload) {
-  res.setHeader("Content-Type", "application/json; charset=utf-8");
-  res.status(200).send(JSON.stringify(payload));
+function uid() {
+  return crypto.randomBytes(16).toString("hex");
 }
 
-function jsonErr(res, code, message, extra) {
-  res.setHeader("Content-Type", "application/json; charset=utf-8");
-  res.status(code).send(JSON.stringify({ ok: false, error: message, ...(extra || {}) }));
-}
-
+// -------------------- OPTIONAL: Verify App Proxy Signature --------------------
 /**
- * (Optional) Verify Shopify App Proxy signature.
- * Leave VERIFY_PROXY=false until everything works.
+ * Shopify App Proxy adds a "signature" query param.
+ * You can validate it using your App Proxy secret.
  *
- * Note: Shopify App Proxy uses `signature` in query params.
- * We'll verify using the shared secret (client secret).
+ * If SHOPIFY_API_SECRET is not set, we skip validation.
+ * (That’s OK during dev, but set it for production.)
  */
 function verifyProxySignature(req) {
-  if (!VERIFY_PROXY) return true;
+  if (!SHOPIFY_API_SECRET) return true;
 
-  const secret = SHOPIFY_CLIENT_SECRET;
-  if (!secret) return false;
+  const q = { ...(req.query || {}) };
 
-  const sig = req.query.signature;
-  if (!sig) return false;
+  // Shopify uses "signature"
+  const provided = q.signature;
+  if (!provided) return false;
 
-  // Build message string: sort all query params except signature
-  const params = { ...req.query };
-  delete params.signature;
+  // Remove signature from message
+  delete q.signature;
 
-  const sorted = Object.keys(params)
+  // Build message: sort keys, concatenate key=value
+  const message = Object.keys(q)
     .sort()
-    .map((k) => `${k}=${Array.isArray(params[k]) ? params[k].join(",") : params[k]}`)
+    .map((k) => `${k}=${q[k]}`)
     .join("");
 
-  const digest = crypto.createHmac("sha256", secret).update(sorted).digest("hex");
+  const digest = crypto
+    .createHmac("sha256", SHOPIFY_API_SECRET)
+    .update(message)
+    .digest("hex");
 
-  return digest === sig;
+  return digest === provided;
 }
 
-/**
- * Client Credentials Grant token caching (24h tokens; we refresh early).
- * Docs: POST https://{shop}.myshopify.com/admin/oauth/access_token
- */
-let tokenCache = {
-  accessToken: null,
-  expiresAtMs: 0,
-  scope: "",
-};
-
-async function getAdminAccessToken() {
-  if (!SHOP_DOMAIN || !SHOPIFY_CLIENT_ID || !SHOPIFY_CLIENT_SECRET) {
-    throw new Error("Missing SHOP_DOMAIN / SHOPIFY_CLIENT_ID / SHOPIFY_CLIENT_SECRET");
+// -------------------- Shopify Admin GraphQL --------------------
+async function shopifyGql(query, variables = {}) {
+  if (!SHOPIFY_SHOP_DOMAIN || !SHOPIFY_ADMIN_TOKEN) {
+    throw new Error("Missing SHOPIFY_SHOP_DOMAIN or SHOPIFY_ADMIN_TOKEN in env.");
   }
 
-  // Use cached token if valid for at least 2 minutes.
-  const safety = 2 * 60 * 1000;
-  if (tokenCache.accessToken && tokenCache.expiresAtMs > nowMs() + safety) {
-    return tokenCache.accessToken;
-  }
-
-  const url = `https://${SHOP_DOMAIN}/admin/oauth/access_token`;
-  const body = new URLSearchParams();
-  body.set("grant_type", "client_credentials");
-  body.set("client_id", SHOPIFY_CLIENT_ID);
-  body.set("client_secret", SHOPIFY_CLIENT_SECRET);
-
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json" },
-    body: body.toString(),
-  });
-
-  const text = await resp.text();
-  let data;
-  try { data = JSON.parse(text); } catch { data = null; }
-
-  if (!resp.ok || !data || !data.access_token) {
-    throw new Error(`Token fetch failed (${resp.status}): ${text.slice(0, 200)}`);
-  }
-
-  const expiresIn = Number(data.expires_in || 0); // seconds (usually 86399)
-  tokenCache.accessToken = data.access_token;
-  tokenCache.scope = data.scope || "";
-  tokenCache.expiresAtMs = nowMs() + (expiresIn > 0 ? expiresIn * 1000 : 23 * 60 * 60 * 1000);
-
-  return tokenCache.accessToken;
-}
-
-async function shopifyGql(query, variables) {
-  const accessToken = await getAdminAccessToken();
-  const url = `https://${SHOP_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`;
+  const url = `https://${SHOPIFY_SHOP_DOMAIN}/admin/api/2025-01/graphql.json`;
 
   const resp = await fetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "Accept": "application/json",
-      "X-Shopify-Access-Token": accessToken,
+      "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN,
     },
-    body: JSON.stringify({ query, variables: variables || {} }),
+    body: JSON.stringify({ query, variables }),
   });
 
   const text = await resp.text();
-  let j;
-  try { j = JSON.parse(text); } catch { j = null; }
 
-  if (!resp.ok || !j) {
-    throw new Error(`Shopify GQL Non-JSON (${resp.status}): ${text.slice(0, 200)}`);
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    throw new Error(`Shopify GraphQL non-JSON (${resp.status}): ${text.slice(0, 200)}`);
   }
 
-  // Robust error handling (avoids "j.errors.map is not a function")
-  if (Array.isArray(j.errors) && j.errors.length) {
-    const msg = j.errors.map((e) => e.message || "GraphQL error").join(" | ");
-    throw new Error(`Shopify GQL errors: ${msg}`);
+  // Handle top-level errors (array)
+  if (Array.isArray(json.errors) && json.errors.length) {
+    const msg = json.errors.map((e) => e.message).join("; ");
+    throw new Error(`Shopify GraphQL errors: ${msg}`);
   }
 
-  if (j.data == null) {
-    throw new Error(`Shopify GQL missing data: ${JSON.stringify(j).slice(0, 200)}`);
-  }
-
-  return j.data;
+  // Some responses include userErrors inside data; caller checks
+  return json;
 }
 
-// Convert gid://shopify/ProductVariant/123 -> "123"
-function gidToNumericId(gid) {
-  if (!gid) return "";
-  const m = String(gid).match(/\/ProductVariant\/(\d+)$/);
-  return m ? m[1] : "";
-}
+/**
+ * Resolve SKUs -> variant ids via GraphQL.
+ * This uses a variant query by SKU (search query).
+ */
+async function resolveSkusToVariants(skus = []) {
+  // Deduplicate + sanitize
+  const cleaned = Array.from(
+    new Set(
+      skus
+        .map((s) => String(s || "").trim())
+        .filter(Boolean)
+        .map((s) => s.toUpperCase())
+    )
+  );
 
-// Resolve SKU -> variant numeric id using Admin API search
-async function resolveSkuToVariant(sku) {
-  const q = String(sku || "").trim();
-  if (!q) return null;
+  if (!cleaned.length) return { found: new Map(), notFound: [] };
 
-  const query = `
-    query($q: String!) {
-      productVariants(first: 1, query: $q) {
+  // We’ll query each sku individually (simple + reliable)
+  const found = new Map();
+  const notFound = [];
+
+  const Q = `
+    query VariantBySku($q: String!) {
+      productVariants(first: 5, query: $q) {
         edges {
           node {
             id
@@ -213,317 +176,302 @@ async function resolveSkuToVariant(sku) {
     }
   `;
 
-  // Admin search syntax: sku:ABC-123
-  const data = await shopifyGql(query, { q: `sku:${q}` });
-  const edge = data?.productVariants?.edges?.[0];
-  const node = edge?.node;
+  for (const sku of cleaned) {
+    const q = `sku:${sku}`;
+    try {
+      const j = await shopifyGql(Q, { q });
 
-  if (!node?.id) return null;
+      const edges = j?.data?.productVariants?.edges || [];
+      if (!edges.length) {
+        notFound.push(sku);
+        continue;
+      }
 
-  const numeric = gidToNumericId(node.id);
-  if (!numeric) return null;
+      // pick exact SKU match if present
+      let exact = edges.find((e) => (e?.node?.sku || "").toUpperCase() === sku);
+      if (!exact) exact = edges[0];
 
-  return {
-    variant_id: numeric,
-    sku: node.sku || q,
-    title: node.product?.title || "",
-    variant_title: node.title || "",
-  };
+      const node = exact?.node;
+      if (!node?.id) {
+        notFound.push(sku);
+        continue;
+      }
+
+      // Shopify GraphQL IDs are gid://shopify/ProductVariant/123...
+      const variantIdNum = String(node.id).split("/").pop();
+      found.set(sku, {
+        variant_id: variantIdNum,
+        sku: node.sku || sku,
+        title: `${node.product?.title || ""}${node.title ? " — " + node.title : ""}`.trim(),
+      });
+    } catch (e) {
+      // If Shopify errors, treat as not found for this sku but continue
+      notFound.push(sku);
+    }
+  }
+
+  return { found, notFound };
 }
 
-// -------------------- Routes --------------------
+// -------------------- Helpers --------------------
+function ok(res, payload = {}) {
+  res.set("Content-Type", "application/json; charset=utf-8");
+  res.status(200).send(JSON.stringify({ ok: true, ...payload }));
+}
 
-// Health
+function fail(res, status = 400, message = "Bad request", extra = {}) {
+  res.set("Content-Type", "application/json; charset=utf-8");
+  res.status(status).send(JSON.stringify({ ok: false, error: message, ...extra }));
+}
+
+function getAction(req) {
+  return String(req.query?.action || "").toLowerCase().trim();
+}
+
+function getCustomerId(req) {
+  // can come from query or body (your liquid includes both)
+  return String(req.query?.customer_id || req.body?.customer_id || "").trim();
+}
+
+function normalizeItems(rawItems) {
+  // rawItems may be an array or a JSON string from URL-encoded posts
+  let items = rawItems;
+
+  if (typeof items === "string") {
+    try {
+      items = JSON.parse(items);
+    } catch {
+      items = [];
+    }
+  }
+
+  items = Array.isArray(items) ? items : [];
+
+  // Normalize each row: { sku, quantity }
+  const cleaned = items
+    .map((it, idx) => {
+      const sku = String(it?.sku || "").trim().toUpperCase();
+      let quantity = parseInt(String(it?.quantity ?? it?.qty ?? "1"), 10);
+      if (!Number.isFinite(quantity) || quantity < 1) quantity = 1;
+      return { sku, quantity, position: idx + 1 };
+    })
+    .filter((x) => x.sku);
+
+  // Merge duplicate SKUs
+  const merged = new Map();
+  for (const it of cleaned) {
+    if (!merged.has(it.sku)) merged.set(it.sku, { sku: it.sku, quantity: 0, position: it.position });
+    merged.get(it.sku).quantity += it.quantity;
+  }
+
+  return Array.from(merged.values());
+}
+
+// -------------------- Health --------------------
 app.get("/", (req, res) => res.send("OK"));
 
-// A simple page so Admin "open app" isn't Not Found (optional)
-app.get("/app", (req, res) => {
-  res.send(`<!doctype html><html><body style="font-family:Arial;padding:24px">
-    <h2>B2B Lists API</h2>
-    <p>Installed. Storefront uses App Proxy endpoints.</p>
-  </body></html>`);
-});
-
+// -------------------- APP PROXY ROUTE --------------------
 /**
- * App Proxy endpoint.
- * Your app proxy should point to: https://b2b-lists-api.onrender.com/proxy
- * Storefront hits: /apps/b2b-lists/proxy?action=...
+ * Your proxy URL in Shopify should point to:
+ *   https://b2b-lists-api.onrender.com/proxy
+ *
+ * Shopify storefront calls:
+ *   /apps/b2b-lists/proxy?action=...
+ * Shopify forwards it to /proxy on Render.
  */
 app.all("/proxy", async (req, res) => {
   try {
+    // Optional signature validation
     if (!verifyProxySignature(req)) {
-      return jsonErr(res, 401, "Invalid proxy signature.");
+      return fail(res, 401, "Invalid proxy signature.");
     }
 
-    const action = String(req.query.action || "").toLowerCase();
-    const method = req.method.toUpperCase();
-
-    // Quick ping for testing
-    if (action === "ping") {
-      return jsonOk(res, { ok: true, pong: true, time: nowMs() });
+    // If DB not configured
+    if (!pool) {
+      const action = getAction(req);
+      if (action === "list") return ok(res, { lists: [] });
+      return fail(res, 500, "DATABASE_URL not set on server.");
     }
 
-    // Basic required param for most actions
-    const customerId =
-      String(req.query.customer_id || req.body?.customer_id || "").trim();
+    const action = getAction(req);
+    const customerId = getCustomerId(req);
 
-    if (!customerId && ["list", "get", "upsert", "delete", "orderify"].includes(action)) {
-      return jsonErr(res, 400, "Missing customer_id");
-    }
+    if (!action) return fail(res, 400, "Missing action.");
+    if (!customerId) return fail(res, 400, "Missing customer_id.");
 
-    // ---------------- LIST ----------------
-    if (action === "list" && method === "GET") {
-      const { rows } = await pool.query(
-        `SELECT id, name, created_at, updated_at
+    // ---------- LIST ----------
+    if (action === "list" && req.method === "GET") {
+      const { rows: lists } = await pool.query(
+        `SELECT id, customer_id, name, updated_at
          FROM lists
-         WHERE customer_id=$1
+         WHERE customer_id = $1
          ORDER BY updated_at DESC`,
         [customerId]
       );
 
-      // include item counts
-      const ids = rows.map((r) => r.id);
-      let counts = {};
+      // attach item counts quickly
+      const ids = lists.map((l) => l.id);
+      let countsById = new Map();
       if (ids.length) {
-        const c = await pool.query(
+        const { rows: counts } = await pool.query(
           `SELECT list_id, COUNT(*)::int AS cnt
            FROM list_items
            WHERE list_id = ANY($1)
            GROUP BY list_id`,
           [ids]
         );
-        c.rows.forEach((r) => (counts[r.list_id] = r.cnt));
+        counts.forEach((c) => countsById.set(c.list_id, c.cnt));
       }
 
-      const lists = rows.map((r) => ({
-        id: r.id,
-        name: r.name,
-        created_at: r.created_at,
-        updated_at: r.updated_at,
-        items_count: counts[r.id] || 0,
+      const shaped = lists.map((l) => ({
+        id: l.id,
+        customer_id: l.customer_id,
+        name: l.name,
+        updated_at: l.updated_at,
+        items: new Array(countsById.get(l.id) || 0).fill({}), // keeps your UI meta stable
+        item_count: countsById.get(l.id) || 0,
       }));
 
-      return jsonOk(res, { ok: true, lists });
+      return ok(res, { lists: shaped });
     }
 
-    // ---------------- GET (single list + items) ----------------
-    if (action === "get" && method === "GET") {
-      const listId = String(req.query.list_id || "").trim();
-      if (!listId) return jsonErr(res, 400, "Missing list_id");
+    // ---------- GET (full list with items) ----------
+    if (action === "get" && req.method === "GET") {
+      const listId = String(req.query?.list_id || "").trim();
+      if (!listId) return fail(res, 400, "Missing list_id.");
 
-      const list = await pool.query(
-        `SELECT id, customer_id, name, created_at, updated_at
+      const { rows: listRows } = await pool.query(
+        `SELECT id, customer_id, name, updated_at
          FROM lists
-         WHERE id=$1 AND customer_id=$2`,
+         WHERE id = $1 AND customer_id = $2`,
         [listId, customerId]
       );
-      if (!list.rows.length) return jsonErr(res, 404, "List not found");
+      if (!listRows.length) return fail(res, 404, "List not found.");
 
-      const items = await pool.query(
-        `SELECT sku, variant_id, quantity, position
+      const { rows: itemRows } = await pool.query(
+        `SELECT sku, quantity, position
          FROM list_items
-         WHERE list_id=$1
+         WHERE list_id = $1
          ORDER BY position ASC`,
         [listId]
       );
 
-      return jsonOk(res, {
-        ok: true,
+      return ok(res, {
         list: {
-          ...list.rows[0],
-          items: items.rows.map((r) => ({
-            sku: r.sku || "",
-            variant_id: r.variant_id,
-            quantity: r.quantity,
-          })),
+          ...listRows[0],
+          items: itemRows.map((r) => ({ sku: r.sku, quantity: r.quantity })),
         },
       });
     }
 
-    // ---------------- UPSERT (create or update) ----------------
-    // Proxy-friendly: URL-encoded POST (items may be JSON string)
-    if (action === "upsert" && method === "POST") {
-      const listIdRaw = String(req.body?.list_id || "").trim();
+    // ---------- UPSERT (create or update) ----------
+    if (action === "upsert" && req.method === "POST") {
+      const listIdIncoming = String(req.body?.list_id || req.query?.list_id || "").trim();
       const name = String(req.body?.name || "").trim();
+      const items = normalizeItems(req.body?.items);
 
-      if (!name) return jsonErr(res, 400, "Missing name");
+      if (!name) return fail(res, 400, "Missing name.");
+      if (!items.length) return fail(res, 400, "No items provided.");
 
-      let items = req.body?.items;
+      const listId = listIdIncoming || uid();
+      const ts = nowMs();
 
-      // items may arrive as a JSON string from URL-encoded posts
-      if (typeof items === "string") {
-        try { items = JSON.parse(items); } catch { items = []; }
-      }
-      items = Array.isArray(items) ? items : [];
+      // Ensure list row
+      await pool.query(
+        `INSERT INTO lists (id, customer_id, name, updated_at)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (id) DO UPDATE SET
+           name = EXCLUDED.name,
+           updated_at = EXCLUDED.updated_at
+         WHERE lists.customer_id = $2`,
+        [listId, customerId, name, ts]
+      );
 
-      // Normalize incoming items: [{sku, quantity}]
-      const cleaned = items
-        .map((it) => ({
-          sku: String(it?.sku || "").trim(),
-          quantity: Math.max(1, parseInt(it?.quantity || it?.qty || "1", 10) || 1),
-        }))
-        .filter((it) => it.sku);
+      // Replace items (simple + reliable)
+      await pool.query(`DELETE FROM list_items WHERE list_id = $1`, [listId]);
 
-      if (!cleaned.length) return jsonErr(res, 400, "No items");
-
-      // Resolve SKUs -> variant numeric IDs
-      const resolved = [];
-      const notFound = [];
-
-      for (const it of cleaned) {
-        const r = await resolveSkuToVariant(it.sku);
-        if (!r) {
-          notFound.push(it.sku);
-          continue;
-        }
-        resolved.push({
-          sku: it.sku,
-          variant_id: r.variant_id,
-          quantity: it.quantity,
-        });
-      }
-
-      if (!resolved.length) {
-        return jsonErr(res, 400, "No SKUs matched", { not_found: notFound });
-      }
-
-      const listId = listIdRaw || crypto.randomUUID();
-      const t = nowMs();
-
-      const client = await pool.connect();
-      try {
-        await client.query("BEGIN");
-
-        // Upsert list header
-        const existing = await client.query(
-          `SELECT id FROM lists WHERE id=$1 AND customer_id=$2`,
-          [listId, customerId]
+      // Insert items
+      for (const it of items) {
+        await pool.query(
+          `INSERT INTO list_items (id, list_id, sku, quantity, position)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [uid(), listId, it.sku, it.quantity, it.position]
         );
-
-        if (existing.rows.length) {
-          await client.query(
-            `UPDATE lists SET name=$1, updated_at=$2 WHERE id=$3 AND customer_id=$4`,
-            [name, t, listId, customerId]
-          );
-        } else {
-          await client.query(
-            `INSERT INTO lists (id, customer_id, name, created_at, updated_at)
-             VALUES ($1,$2,$3,$4,$5)`,
-            [listId, customerId, name, t, t]
-          );
-        }
-
-        // Replace items
-        await client.query(`DELETE FROM list_items WHERE list_id=$1`, [listId]);
-
-        for (let i = 0; i < resolved.length; i++) {
-          const row = resolved[i];
-          await client.query(
-            `INSERT INTO list_items (id, list_id, sku, variant_id, quantity, position)
-             VALUES ($1,$2,$3,$4,$5,$6)`,
-            [crypto.randomUUID(), listId, row.sku, row.variant_id, row.quantity, i]
-          );
-        }
-
-        await client.query("COMMIT");
-      } catch (e) {
-        await client.query("ROLLBACK");
-        throw e;
-      } finally {
-        client.release();
       }
 
-      return jsonOk(res, {
-        ok: true,
-        list_id: listId,
-        saved_count: resolved.length,
-        not_found: notFound,
-      });
+      return ok(res, { list_id: listId });
     }
 
-    // ---------------- DELETE ----------------
-    if (action === "delete" && method === "POST") {
-      const listId = String(req.body?.list_id || req.query.list_id || "").trim();
-      if (!listId) return jsonErr(res, 400, "Missing list_id");
+    // ---------- DELETE ----------
+    if (action === "delete" && req.method === "POST") {
+      const listId = String(req.body?.list_id || req.query?.list_id || "").trim();
+      if (!listId) return fail(res, 400, "Missing list_id.");
 
-      const client = await pool.connect();
-      try {
-        await client.query("BEGIN");
-        await client.query(
-          `DELETE FROM list_items WHERE list_id=$1`,
-          [listId]
-        );
-        const del = await client.query(
-          `DELETE FROM lists WHERE id=$1 AND customer_id=$2`,
-          [listId, customerId]
-        );
-        await client.query("COMMIT");
-
-        if (!del.rowCount) return jsonErr(res, 404, "List not found");
-      } catch (e) {
-        await client.query("ROLLBACK");
-        throw e;
-      } finally {
-        client.release();
-      }
-
-      return jsonOk(res, { ok: true });
-    }
-
-    // ---------------- ORDERIFY ----------------
-    // Returns line items + a cart permalink you can redirect to.
-    // GET /proxy?action=orderify&customer_id=...&list_id=...
-    if (action === "orderify" && method === "GET") {
-      const listId = String(req.query.list_id || "").trim();
-      if (!listId) return jsonErr(res, 400, "Missing list_id");
-
-      const list = await pool.query(
-        `SELECT id, name FROM lists WHERE id=$1 AND customer_id=$2`,
+      // Only delete if belongs to this customer
+      const r = await pool.query(
+        `DELETE FROM lists WHERE id = $1 AND customer_id = $2`,
         [listId, customerId]
       );
-      if (!list.rows.length) return jsonErr(res, 404, "List not found");
 
-      const items = await pool.query(
-        `SELECT variant_id, quantity
+      if (r.rowCount === 0) return fail(res, 404, "List not found.");
+      return ok(res, {});
+    }
+
+    // ---------- ORDERIFY (convert saved SKUs -> variant ids) ----------
+    if (action === "orderify" && req.method === "GET") {
+      const listId = String(req.query?.list_id || "").trim();
+      if (!listId) return fail(res, 400, "Missing list_id.");
+
+      const { rows: listRows } = await pool.query(
+        `SELECT id FROM lists WHERE id = $1 AND customer_id = $2`,
+        [listId, customerId]
+      );
+      if (!listRows.length) return fail(res, 404, "List not found.");
+
+      const { rows: itemRows } = await pool.query(
+        `SELECT sku, quantity
          FROM list_items
-         WHERE list_id=$1
+         WHERE list_id = $1
          ORDER BY position ASC`,
         [listId]
       );
 
-      const lines = items.rows.map((r) => ({
-        variant_id: r.variant_id,
-        quantity: r.quantity,
-      }));
+      const skus = itemRows.map((r) => r.sku);
+      const { found, notFound } = await resolveSkusToVariants(skus);
 
-      // cart permalink: /cart/123:2,456:1
-      const permalink = "/cart/" + lines.map((l) => `${l.variant_id}:${l.quantity}`).join(",");
+      const items = [];
+      for (const row of itemRows) {
+        const hit = found.get(String(row.sku).toUpperCase());
+        if (!hit) continue;
+        items.push({
+          sku: row.sku,
+          quantity: row.quantity,
+          variant_id: hit.variant_id,
+          title: hit.title,
+        });
+      }
 
-      return jsonOk(res, {
-        ok: true,
-        list: { id: listId, name: list.rows[0].name },
-        lines,
-        cart_url: permalink,
-      });
+      return ok(res, { items, not_found: notFound });
     }
 
-    // If action doesn't match
-    return jsonErr(res, 400, `Unsupported action/method. action=${action} method=${method}`);
-  } catch (e) {
-    console.error("Proxy error:", e);
-    return jsonErr(res, 500, "Server error", { details: String(e?.message || e) });
+    // Anything else
+    return fail(res, 400, `Unsupported action/method. action=${action} method=${req.method}`);
+  } catch (err) {
+    // IMPORTANT: return JSON (so your Liquid doesn't get HTML)
+    console.error("Proxy error:", err);
+    return fail(res, 500, "Server error", { detail: String(err?.message || err) });
   }
 });
 
-// -------------------- Start --------------------
+// -------------------- START --------------------
 const PORT = process.env.PORT || 3000;
 
 async function start() {
   app.listen(PORT, () => console.log("Server running on port " + PORT));
 }
 
-if (!DATABASE_URL) {
-  console.log("DATABASE_URL not set — running without DB (local dev mode).");
+if (!pool) {
+  console.log("DATABASE_URL not set — running without DB.");
   start();
 } else {
   ensureTables()
