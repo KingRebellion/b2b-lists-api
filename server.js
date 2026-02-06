@@ -375,3 +375,13 @@ if (!DATABASE_URL) {
       process.exit(1);
     });
 }
+app.get("/app", (req, res) => {
+  res.send(`
+    <html>
+      <body style="font-family: Arial; padding: 24px;">
+        <h2>B2B Lists</h2>
+        <p>App is installed. Storefront lists load via App Proxy.</p>
+      </body>
+    </html>
+  `);
+});
