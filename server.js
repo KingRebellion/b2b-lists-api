@@ -9,7 +9,7 @@ const app = express();
 app.use(express.urlencoded({ extended: false, limit: "1mb" }));
 app.use(express.json({ limit: "1mb" }));
 
-// Optional: prevent Shopify proxy returning HTML on long waits
+// Prevent Shopify proxy returning HTML on long waits
 app.use((req, res, next) => {
   res.setTimeout(12000, () => {
     res.status(200).json({ ok: false, error: "Timeout. Please retry." });
@@ -30,19 +30,19 @@ function uid(prefix = "") {
   return prefix + crypto.randomBytes(16).toString("hex");
 }
 
-function sendJson(res, status, obj) {
-  res.status(status);
+function sendJson(res, obj) {
+  // IMPORTANT: Always 200 so Shopify App Proxy does NOT swap response into HTML error pages
+  res.status(200);
   res.set("Content-Type", "application/json; charset=utf-8");
   res.send(JSON.stringify(obj));
 }
 
 function ok(res, obj = {}) {
-  return sendJson(res, 200, { ok: true, ...obj });
+  return sendJson(res, { ok: true, ...obj });
 }
 
-function bad(res, msg = "Bad request") {
-  // IMPORTANT: App Proxy + Shopify can convert non-200 into HTML error pages.
-  return sendJson(res, 200, { ok: false, error: msg });
+function bad(res, msg = "Bad request", detail = "") {
+  return sendJson(res, { ok: false, error: msg, ...(detail ? { error_detail: detail } : {}) });
 }
 
 function parseItems(req) {
@@ -93,7 +93,6 @@ async function ensureTables() {
     );
   `);
 
-  // Store SKU + quantity (no Admin API required)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS list_items (
       id TEXT PRIMARY KEY,
@@ -117,9 +116,6 @@ app.get("/", (req, res) => {
  * APP PROXY ENDPOINT
  * Shopify App Proxy should point to:
  *   https://YOUR-RENDER-DOMAIN/proxy
- *
- * Example:
- *   /apps/b2b-lists/proxy?action=list&customer_id=123
  */
 app.all("/proxy", async (req, res) => {
   try {
@@ -131,6 +127,19 @@ app.all("/proxy", async (req, res) => {
 
     if (!action) return bad(res, "Missing action");
     if (!customer_id) return bad(res, "Missing customer_id");
+
+    // --------- DEBUG: ECHO (use temporarily) ----------
+    // Test from storefront:
+    // POST /apps/b2b-lists/proxy?action=echo&customer_id=123
+    if (action === "echo") {
+      return ok(res, {
+        method: req.method,
+        query: req.query,
+        body_keys: Object.keys(req.body || {}),
+        body: req.body || null,
+        content_type: req.headers["content-type"] || null
+      });
+    }
 
     // ---------- LIST (FAST: single query) ----------
     if (action === "list" && req.method === "GET") {
@@ -168,7 +177,7 @@ app.all("/proxy", async (req, res) => {
         `,
         [list_id, customer_id]
       );
-      if (!lrows.length) return bad(res, "List not found", 404);
+      if (!lrows.length) return bad(res, "List not found");
 
       const { rows: irows } = await pool.query(
         `
@@ -191,8 +200,6 @@ app.all("/proxy", async (req, res) => {
     }
 
     // ---------- UPSERT (create/update) ----------
-    // Expects URL-encoded body with:
-    // customer_id, list_id(optional), name, items(JSON string)
     if (action === "upsert" && req.method === "POST") {
       const list_id_in = String(req.body?.list_id || "").trim();
       const name = String(req.body?.name || "").trim();
@@ -233,7 +240,6 @@ app.all("/proxy", async (req, res) => {
     }
 
     // ---------- DELETE ----------
-    // POST body: customer_id, list_id
     if (action === "delete" && req.method === "POST") {
       const list_id = String(req.body?.list_id || "").trim();
       if (!list_id) return bad(res, "Missing list_id");
@@ -242,7 +248,7 @@ app.all("/proxy", async (req, res) => {
         `SELECT id FROM lists WHERE id=$1 AND customer_id=$2 LIMIT 1`,
         [list_id, customer_id]
       );
-      if (!owned.length) return bad(res, "List not found", 404);
+      if (!owned.length) return bad(res, "List not found");
 
       await pool.query(`DELETE FROM list_items WHERE list_id=$1`, [list_id]);
       await pool.query(`DELETE FROM lists WHERE id=$1 AND customer_id=$2`, [list_id, customer_id]);
@@ -252,10 +258,12 @@ app.all("/proxy", async (req, res) => {
 
     return bad(res, `Unsupported action/method. action=${action} method=${req.method}`);
   } catch (err) {
-  console.error("Proxy error:", err);
-  return sendJson(res, 200, { ok: false, error: "Server error" });
-}
+    // LOG to Render
+    console.error("Proxy error:", err);
 
+    // Return JSON (200) so Shopify doesn't swap to HTML, but include detail for debugging
+    return bad(res, "Server error", String(err?.message || err));
+  }
 });
 
 // ---------- start ----------
