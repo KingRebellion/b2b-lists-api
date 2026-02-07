@@ -5,29 +5,34 @@ import pg from "pg";
 const { Pool } = pg;
 const app = express();
 
-/* -------------------------------------------------
-   Middleware
-------------------------------------------------- */
-
-app.use(express.urlencoded({ extended: true }));
+app.use(express.urlencoded({ extended: true, limit: "1mb" }));
 app.use(express.json({ limit: "1mb" }));
-
-/* -------------------------------------------------
-   ENV
-------------------------------------------------- */
 
 const DATABASE_URL = process.env.DATABASE_URL || "";
 
 const pool = new Pool({
   connectionString: DATABASE_URL,
-  ssl: DATABASE_URL.includes("render.com")
-    ? { rejectUnauthorized: false }
-    : false
+  ssl: DATABASE_URL.includes("render.com") ? { rejectUnauthorized: false } : false
 });
 
-/* -------------------------------------------------
-   DB Setup (NO position column)
-------------------------------------------------- */
+function uid(prefix = "") {
+  return prefix + crypto.randomBytes(16).toString("hex");
+}
+
+function sendJson(res, obj) {
+  // IMPORTANT: Always 200 for Shopify App Proxy stability
+  res.status(200);
+  res.set("Content-Type", "application/json; charset=utf-8");
+  res.send(JSON.stringify(obj));
+}
+
+function ok(res, obj = {}) {
+  return sendJson(res, { ok: true, ...obj });
+}
+
+function bad(res, msg = "Bad request", detail = "") {
+  return sendJson(res, { ok: false, error: msg, ...(detail ? { detail } : {}) });
+}
 
 async function ensureTables() {
   await pool.query(`
@@ -40,6 +45,7 @@ async function ensureTables() {
     );
   `);
 
+  // NOTE: this matches your DB that uses variant_id (not sku) + no position
   await pool.query(`
     CREATE TABLE IF NOT EXISTS list_items (
       id TEXT PRIMARY KEY,
@@ -50,304 +56,192 @@ async function ensureTables() {
   `);
 }
 
-/* -------------------------------------------------
-   Helpers
-------------------------------------------------- */
-
-function uid() {
-  return crypto.randomBytes(16).toString("hex");
-}
-
-function now() {
-  return Date.now();
-}
-
-/* -------------------------------------------------
-   Health Check
-------------------------------------------------- */
-
-app.get("/", (req, res) => {
-  res.send("OK");
-});
-
-/* -------------------------------------------------
-   PROXY ENDPOINT
-------------------------------------------------- */
+app.get("/", (req, res) => res.send("OK"));
 
 app.all("/proxy", async (req, res) => {
   try {
+    const action = String(req.query.action || req.body.action || "").toLowerCase();
+    const customer_id = String(req.query.customer_id || req.body.customer_id || "").trim();
 
-    const action =
-      req.query.action ||
-      req.body.action ||
-      "";
+    if (!action) return bad(res, "Missing action");
+    if (!customer_id) return bad(res, "Missing customer_id");
 
-    const customerId =
-      req.query.customer_id ||
-      req.body.customer_id ||
-      "";
-
-    if (!action) {
-      return res.json({ ok: false, error: "Missing action" });
+    // Debug helper
+    if (action === "echo") {
+      return ok(res, {
+        method: req.method,
+        query: req.query,
+        body: req.body,
+        content_type: req.headers["content-type"] || null
+      });
     }
 
-    if (!customerId) {
-      return res.json({ ok: false, error: "Missing customer_id" });
-    }
-
-    /* -------------------------------------------
-       LIST
-    ------------------------------------------- */
-
-    if (action === "list") {
-
-      const listsRes = await pool.query(
-        `SELECT * FROM lists
-         WHERE customer_id = $1
+    // LIST
+    if (action === "list" && req.method === "GET") {
+      const { rows: lists } = await pool.query(
+        `SELECT id, name, created_at, updated_at
+         FROM lists
+         WHERE customer_id=$1
          ORDER BY updated_at DESC`,
-        [customerId]
+        [customer_id]
       );
 
-      const lists = [];
-
-      for (const row of listsRes.rows) {
-
-        const itemsRes = await pool.query(
+      // Attach items to each list
+      const out = [];
+      for (const l of lists) {
+        const { rows: items } = await pool.query(
           `SELECT variant_id, quantity
            FROM list_items
-           WHERE list_id = $1`,
-          [row.id]
+           WHERE list_id=$1`,
+          [l.id]
         );
 
-        lists.push({
-          id: row.id,
-          name: row.name,
-          created_at: row.created_at,
-          updated_at: row.updated_at,
-          items: itemsRes.rows
+        out.push({
+          id: l.id,
+          name: l.name,
+          created_at: l.created_at,
+          updated_at: l.updated_at,
+          items
         });
       }
 
-      return res.json({ ok: true, lists });
+      return ok(res, { lists: out });
     }
 
-    /* -------------------------------------------
-       GET
-    ------------------------------------------- */
+    // GET
+    if (action === "get" && req.method === "GET") {
+      const list_id = String(req.query.list_id || "").trim();
+      if (!list_id) return bad(res, "Missing list_id");
 
-    if (action === "get") {
-
-      const listId =
-        req.query.list_id ||
-        req.body.list_id;
-
-      if (!listId) {
-        return res.json({ ok: false, error: "Missing list_id" });
-      }
-
-      const listRes = await pool.query(
-        `SELECT * FROM lists
-         WHERE id = $1
-         AND customer_id = $2`,
-        [listId, customerId]
+      const { rows: lrows } = await pool.query(
+        `SELECT id, name, created_at, updated_at
+         FROM lists
+         WHERE id=$1 AND customer_id=$2
+         LIMIT 1`,
+        [list_id, customer_id]
       );
 
-      if (!listRes.rows.length) {
-        return res.json({ ok: false, error: "Not found" });
-      }
+      if (!lrows.length) return bad(res, "List not found");
 
-      const itemsRes = await pool.query(
+      const { rows: items } = await pool.query(
         `SELECT variant_id, quantity
          FROM list_items
-         WHERE list_id = $1`,
-        [listId]
+         WHERE list_id=$1`,
+        [list_id]
       );
 
-      return res.json({
-        ok: true,
-        list: {
-          id: listId,
-          name: listRes.rows[0].name,
-          items: itemsRes.rows
-        }
-      });
+      return ok(res, { list: { ...lrows[0], items } });
     }
 
-    /* -------------------------------------------
-       UPSERT (CREATE / UPDATE)
-    ------------------------------------------- */
-
+    // UPSERT (expects items to be [{variant_id, quantity}, ...])
     if (action === "upsert" && req.method === "POST") {
+      let list_id = String(req.body.list_id || "").trim();
+      const name = String(req.body.name || "").trim();
+      if (!name) return bad(res, "Missing name");
 
-      let {
-        list_id,
-        name,
-        items
-      } = req.body;
+      let items = req.body.items;
 
-      if (!name) {
-        return res.json({ ok: false, error: "Missing name" });
-      }
-
-      /* Parse items */
       if (typeof items === "string") {
-        try {
-          items = JSON.parse(items);
-        } catch {
-          items = [];
-        }
+        try { items = JSON.parse(items); } catch { items = []; }
       }
-
       items = Array.isArray(items) ? items : [];
 
-      const ts = now();
+      // Clean items
+      const cleaned = [];
+      for (const it of items) {
+        const vid = String(it?.variant_id || "").trim();
+        let qty = parseInt(it?.quantity, 10);
+        if (!vid) continue;
+        if (!qty || qty < 1) qty = 1;
+        cleaned.push({ variant_id: vid, quantity: qty });
+      }
+      if (!cleaned.length) return bad(res, "No valid items provided");
 
-      let listId = list_id || uid();
+      const ts = Date.now();
+      if (!list_id) list_id = uid("list_");
 
-      /* Insert / Update list */
-
-      const exists = await pool.query(
-        `SELECT id FROM lists WHERE id = $1`,
-        [listId]
+      // Create or update list (keep created_at on updates)
+      const { rows: exists } = await pool.query(
+        `SELECT id, created_at FROM lists WHERE id=$1 AND customer_id=$2 LIMIT 1`,
+        [list_id, customer_id]
       );
 
-      if (!exists.rows.length) {
-
+      if (!exists.length) {
         await pool.query(
-          `INSERT INTO lists
-           (id, customer_id, name, created_at, updated_at)
+          `INSERT INTO lists (id, customer_id, name, created_at, updated_at)
            VALUES ($1,$2,$3,$4,$5)`,
-          [listId, customerId, name, ts, ts]
+          [list_id, customer_id, name, ts, ts]
         );
-
       } else {
-
         await pool.query(
           `UPDATE lists
-           SET name = $1,
-               updated_at = $2
-           WHERE id = $3
-           AND customer_id = $4`,
-          [name, ts, listId, customerId]
+           SET name=$1, updated_at=$2
+           WHERE id=$3 AND customer_id=$4`,
+          [name, ts, list_id, customer_id]
         );
       }
 
-      /* Replace items */
+      // Replace items
+      await pool.query(`DELETE FROM list_items WHERE list_id=$1`, [list_id]);
 
-      await pool.query(
-        `DELETE FROM list_items WHERE list_id = $1`,
-        [listId]
-      );
-
-      for (const it of items) {
-
-        if (!it.variant_id || !it.quantity) continue;
-
+      for (const it of cleaned) {
         await pool.query(
-          `INSERT INTO list_items
-           (id, list_id, variant_id, quantity)
+          `INSERT INTO list_items (id, list_id, variant_id, quantity)
            VALUES ($1,$2,$3,$4)`,
-          [uid(), listId, it.variant_id, it.quantity]
+          [uid("itm_"), list_id, it.variant_id, it.quantity]
         );
       }
 
-      return res.json({ ok: true, id: listId });
+      return ok(res, { list_id, updated_at: ts, items_saved: cleaned.length });
     }
 
-    /* -------------------------------------------
-       DELETE
-    ------------------------------------------- */
-
+    // DELETE
     if (action === "delete" && req.method === "POST") {
+      const list_id = String(req.body.list_id || req.query.list_id || "").trim();
+      if (!list_id) return bad(res, "Missing list_id");
 
-      const listId =
-        req.query.list_id ||
-        req.body.list_id;
+      await pool.query(`DELETE FROM list_items WHERE list_id=$1`, [list_id]);
+      await pool.query(`DELETE FROM lists WHERE id=$1 AND customer_id=$2`, [list_id, customer_id]);
 
-      if (!listId) {
-        return res.json({ ok: false, error: "Missing list_id" });
-      }
-
-      await pool.query(
-        `DELETE FROM list_items WHERE list_id = $1`,
-        [listId]
-      );
-
-      await pool.query(
-        `DELETE FROM lists
-         WHERE id = $1
-         AND customer_id = $2`,
-        [listId, customerId]
-      );
-
-      return res.json({ ok: true });
+      return ok(res, { deleted: true });
     }
 
-    /* -------------------------------------------
-       ORDERIFY (FOR REORDER)
-    ------------------------------------------- */
+    // ORDERIFY (returns items ready to add to cart)
+    if (action === "orderify" && req.method === "GET") {
+      const list_id = String(req.query.list_id || "").trim();
+      if (!list_id) return bad(res, "Missing list_id");
 
-    if (action === "orderify") {
-
-      const listId =
-        req.query.list_id ||
-        req.body.list_id;
-
-      if (!listId) {
-        return res.json({ ok: false, error: "Missing list_id" });
-      }
-
-      const itemsRes = await pool.query(
+      const { rows: items } = await pool.query(
         `SELECT variant_id, quantity
          FROM list_items
-         WHERE list_id = $1`,
-        [listId]
+         WHERE list_id=$1`,
+        [list_id]
       );
 
-      return res.json({
-        ok: true,
-        items: itemsRes.rows
-      });
+      return ok(res, { items });
     }
 
-    /* -------------------------------------------
-       FALLBACK
-    ------------------------------------------- */
-
-    return res.json({
-      ok: false,
-      error: "Unsupported action/method"
-    });
-
+    return bad(res, `Unsupported action/method. action=${action} method=${req.method}`);
   } catch (err) {
-
     console.error("Proxy error:", err);
-
-    return res.status(500).json({
-      ok: false,
-      error: "Server error"
-    });
+    // IMPORTANT: Still return JSON 200
+    return bad(res, "Server error", err?.message || String(err));
   }
 });
-
-/* -------------------------------------------------
-   START
-------------------------------------------------- */
 
 const PORT = process.env.PORT || 3000;
 
 async function start() {
-
-  if (DATABASE_URL) {
-    await ensureTables();
-    console.log("DB ready");
-  } else {
-    console.log("DATABASE_URL not set");
+  if (!DATABASE_URL) {
+    console.error("DATABASE_URL not set");
+    process.exit(1);
   }
-
-  app.listen(PORT, () => {
-    console.log("Server running on " + PORT);
-  });
+  await ensureTables();
+  app.listen(PORT, () => console.log("Server running on port " + PORT));
 }
 
-start();
+start().catch((e) => {
+  console.error("Startup failed:", e);
+  process.exit(1);
+});
+
