@@ -20,7 +20,7 @@ function uid(prefix = "") {
 }
 
 function sendJson(res, obj) {
-  // IMPORTANT: Always 200 for Shopify App Proxy stability
+  // Always 200 JSON for Shopify App Proxy stability
   res.status(200);
   res.set("Content-Type", "application/json; charset=utf-8");
   res.send(JSON.stringify(obj));
@@ -34,6 +34,32 @@ function bad(res, msg = "Bad request", detail = "") {
   return sendJson(res, { ok: false, error: msg, ...(detail ? { detail } : {}) });
 }
 
+function parseItemsFromBody(req) {
+  // items may arrive as JSON string (urlencoded) or array (json)
+  let items = req.body?.items;
+
+  if (typeof items === "string") {
+    try { items = JSON.parse(items); } catch { items = []; }
+  }
+  items = Array.isArray(items) ? items : [];
+
+  const cleaned = [];
+  for (const it of items) {
+    const sku = String(it?.sku || "").trim();
+    let qty = parseInt(it?.quantity, 10);
+    if (!sku) continue;
+    if (!qty || qty < 1) qty = 1;
+    cleaned.push({ sku: sku.toUpperCase(), quantity: qty });
+  }
+
+  // merge duplicate SKUs
+  const map = new Map();
+  for (const it of cleaned) {
+    map.set(it.sku, (map.get(it.sku) || 0) + it.quantity);
+  }
+  return Array.from(map.entries()).map(([sku, quantity]) => ({ sku, quantity }));
+}
+
 async function ensureTables() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS lists (
@@ -45,15 +71,21 @@ async function ensureTables() {
     );
   `);
 
-  // NOTE: this matches your DB that uses variant_id (not sku) + no position
+  // SKU-based table (NO variant_id, NO position)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS list_items (
       id TEXT PRIMARY KEY,
       list_id TEXT NOT NULL,
-      variant_id TEXT NOT NULL,
+      sku TEXT NOT NULL,
       quantity INT NOT NULL
     );
   `);
+
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_lists_customer ON lists(customer_id);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_items_list ON list_items(list_id);`);
+
+  // If you previously created list_items without sku, this will still fail —
+  // but based on your error, you DO have sku and NOT variant_id, so we're aligning to that.
 }
 
 app.get("/", (req, res) => res.send("OK"));
@@ -71,7 +103,8 @@ app.all("/proxy", async (req, res) => {
       return ok(res, {
         method: req.method,
         query: req.query,
-        body: req.body,
+        body_keys: Object.keys(req.body || {}),
+        body: req.body || null,
         content_type: req.headers["content-type"] || null
       });
     }
@@ -79,30 +112,27 @@ app.all("/proxy", async (req, res) => {
     // LIST
     if (action === "list" && req.method === "GET") {
       const { rows: lists } = await pool.query(
-        `SELECT id, name, created_at, updated_at
-         FROM lists
-         WHERE customer_id=$1
-         ORDER BY updated_at DESC`,
+        `
+        SELECT id, name, created_at, updated_at
+        FROM lists
+        WHERE customer_id=$1
+        ORDER BY updated_at DESC
+        `,
         [customer_id]
       );
 
-      // Attach items to each list
       const out = [];
       for (const l of lists) {
         const { rows: items } = await pool.query(
-          `SELECT variant_id, quantity
-           FROM list_items
-           WHERE list_id=$1`,
+          `
+          SELECT sku, quantity
+          FROM list_items
+          WHERE list_id=$1
+          `,
           [l.id]
         );
 
-        out.push({
-          id: l.id,
-          name: l.name,
-          created_at: l.created_at,
-          updated_at: l.updated_at,
-          items
-        });
+        out.push({ ...l, items });
       }
 
       return ok(res, { lists: out });
@@ -114,69 +144,60 @@ app.all("/proxy", async (req, res) => {
       if (!list_id) return bad(res, "Missing list_id");
 
       const { rows: lrows } = await pool.query(
-        `SELECT id, name, created_at, updated_at
-         FROM lists
-         WHERE id=$1 AND customer_id=$2
-         LIMIT 1`,
+        `
+        SELECT id, name, created_at, updated_at
+        FROM lists
+        WHERE id=$1 AND customer_id=$2
+        LIMIT 1
+        `,
         [list_id, customer_id]
       );
-
       if (!lrows.length) return bad(res, "List not found");
 
       const { rows: items } = await pool.query(
-        `SELECT variant_id, quantity
-         FROM list_items
-         WHERE list_id=$1`,
+        `
+        SELECT sku, quantity
+        FROM list_items
+        WHERE list_id=$1
+        `,
         [list_id]
       );
 
       return ok(res, { list: { ...lrows[0], items } });
     }
 
-    // UPSERT (expects items to be [{variant_id, quantity}, ...])
+    // UPSERT (expects items as [{sku, quantity}, ...])
     if (action === "upsert" && req.method === "POST") {
-      let list_id = String(req.body.list_id || "").trim();
+      const list_id_in = String(req.body.list_id || "").trim();
       const name = String(req.body.name || "").trim();
       if (!name) return bad(res, "Missing name");
 
-      let items = req.body.items;
+      const items = parseItemsFromBody(req);
+      if (!items.length) return bad(res, "No valid items provided");
 
-      if (typeof items === "string") {
-        try { items = JSON.parse(items); } catch { items = []; }
-      }
-      items = Array.isArray(items) ? items : [];
-
-      // Clean items
-      const cleaned = [];
-      for (const it of items) {
-        const vid = String(it?.variant_id || "").trim();
-        let qty = parseInt(it?.quantity, 10);
-        if (!vid) continue;
-        if (!qty || qty < 1) qty = 1;
-        cleaned.push({ variant_id: vid, quantity: qty });
-      }
-      if (!cleaned.length) return bad(res, "No valid items provided");
-
+      const list_id = list_id_in || uid("list_");
       const ts = Date.now();
-      if (!list_id) list_id = uid("list_");
 
-      // Create or update list (keep created_at on updates)
       const { rows: exists } = await pool.query(
-        `SELECT id, created_at FROM lists WHERE id=$1 AND customer_id=$2 LIMIT 1`,
+        `SELECT id FROM lists WHERE id=$1 AND customer_id=$2 LIMIT 1`,
         [list_id, customer_id]
       );
 
       if (!exists.length) {
         await pool.query(
-          `INSERT INTO lists (id, customer_id, name, created_at, updated_at)
-           VALUES ($1,$2,$3,$4,$5)`,
+          `
+          INSERT INTO lists (id, customer_id, name, created_at, updated_at)
+          VALUES ($1,$2,$3,$4,$5)
+          `,
           [list_id, customer_id, name, ts, ts]
         );
       } else {
         await pool.query(
-          `UPDATE lists
-           SET name=$1, updated_at=$2
-           WHERE id=$3 AND customer_id=$4`,
+          `
+          UPDATE lists
+          SET name=$1, updated_at=$2
+          WHERE id=$3 AND customer_id=$4
+          `,
           [name, ts, list_id, customer_id]
         );
       }
@@ -184,15 +205,17 @@ app.all("/proxy", async (req, res) => {
       // Replace items
       await pool.query(`DELETE FROM list_items WHERE list_id=$1`, [list_id]);
 
-      for (const it of cleaned) {
+      for (const it of items) {
         await pool.query(
-          `INSERT INTO list_items (id, list_id, variant_id, quantity)
-           VALUES ($1,$2,$3,$4)`,
-          [uid("itm_"), list_id, it.variant_id, it.quantity]
+          `
+          INSERT INTO list_items (id, list_id, sku, quantity)
+          VALUES ($1,$2,$3,$4)
+          `,
+          [uid("itm_"), list_id, it.sku, it.quantity]
         );
       }
 
-      return ok(res, { list_id, updated_at: ts, items_saved: cleaned.length });
+      return ok(res, { list_id, updated_at: ts, items_saved: items.length });
     }
 
     // DELETE
@@ -206,15 +229,13 @@ app.all("/proxy", async (req, res) => {
       return ok(res, { deleted: true });
     }
 
-    // ORDERIFY (returns items ready to add to cart)
+    // ORDERIFY (returns sku/qty)
     if (action === "orderify" && req.method === "GET") {
       const list_id = String(req.query.list_id || "").trim();
       if (!list_id) return bad(res, "Missing list_id");
 
       const { rows: items } = await pool.query(
-        `SELECT variant_id, quantity
-         FROM list_items
-         WHERE list_id=$1`,
+        `SELECT sku, quantity FROM list_items WHERE list_id=$1`,
         [list_id]
       );
 
@@ -224,7 +245,6 @@ app.all("/proxy", async (req, res) => {
     return bad(res, `Unsupported action/method. action=${action} method=${req.method}`);
   } catch (err) {
     console.error("Proxy error:", err);
-    // IMPORTANT: Still return JSON 200
     return bad(res, "Server error", err?.message || String(err));
   }
 });
