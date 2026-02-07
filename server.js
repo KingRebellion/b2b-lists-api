@@ -42,7 +42,11 @@ function ok(res, obj = {}) {
 }
 
 function bad(res, msg = "Bad request", detail = "") {
-  return sendJson(res, { ok: false, error: msg, ...(detail ? { error_detail: detail } : {}) });
+  return sendJson(res, {
+    ok: false,
+    error: msg,
+    ...(detail ? { error_detail: detail } : {})
+  });
 }
 
 function parseItems(req) {
@@ -114,7 +118,7 @@ app.get("/", (req, res) => {
 
 /**
  * APP PROXY ENDPOINT
- * Shopify App Proxy should point to:
+ * App Proxy should point to:
  *   https://YOUR-RENDER-DOMAIN/proxy
  */
 app.all("/proxy", async (req, res) => {
@@ -128,9 +132,9 @@ app.all("/proxy", async (req, res) => {
     if (!action) return bad(res, "Missing action");
     if (!customer_id) return bad(res, "Missing customer_id");
 
-    // --------- DEBUG: ECHO (use temporarily) ----------
-    // Test from storefront:
-    // POST /apps/b2b-lists/proxy?action=echo&customer_id=123
+    // --------- DEBUG: ECHO ----------
+    // GET /proxy?action=echo&customer_id=123
+    // POST /proxy?action=echo&customer_id=123 (with form body)
     if (action === "echo") {
       return ok(res, {
         method: req.method,
@@ -141,7 +145,7 @@ app.all("/proxy", async (req, res) => {
       });
     }
 
-    // ---------- LIST (FAST: single query) ----------
+    // ---------- LIST (FAST) ----------
     if (action === "list" && req.method === "GET") {
       const { rows } = await pool.query(
         `
@@ -163,7 +167,7 @@ app.all("/proxy", async (req, res) => {
       return ok(res, { lists: rows });
     }
 
-    // ---------- GET (full list + items) ----------
+    // ---------- GET ----------
     if (action === "get" && req.method === "GET") {
       const list_id = String(req.query?.list_id || "").trim();
       if (!list_id) return bad(res, "Missing list_id");
@@ -199,7 +203,7 @@ app.all("/proxy", async (req, res) => {
       });
     }
 
-    // ---------- UPSERT (create/update) ----------
+    // ---------- UPSERT ----------
     if (action === "upsert" && req.method === "POST") {
       const list_id_in = String(req.body?.list_id || "").trim();
       const name = String(req.body?.name || "").trim();
@@ -211,7 +215,6 @@ app.all("/proxy", async (req, res) => {
       const list_id = list_id_in || uid("list_");
       const updated_at = Date.now();
 
-      // Create/Update list
       await pool.query(
         `
         INSERT INTO lists (id, customer_id, name, updated_at)
@@ -223,7 +226,6 @@ app.all("/proxy", async (req, res) => {
         [list_id, customer_id, name, updated_at]
       );
 
-      // Replace items
       await pool.query(`DELETE FROM list_items WHERE list_id=$1`, [list_id]);
 
       for (const it of items) {
@@ -258,11 +260,15 @@ app.all("/proxy", async (req, res) => {
 
     return bad(res, `Unsupported action/method. action=${action} method=${req.method}`);
   } catch (err) {
-    // LOG to Render
     console.error("Proxy error:", err);
 
-    // Return JSON (200) so Shopify doesn't swap to HTML, but include detail for debugging
-    return bad(res, "Server error", String(err?.message || err));
+    const detail =
+      (err && err.stack) ? err.stack :
+      (err && err.message) ? err.message :
+      String(err);
+
+    // Still 200 JSON (Shopify-safe)
+    return bad(res, "Server error", detail);
   }
 });
 
