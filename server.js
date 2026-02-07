@@ -5,92 +5,31 @@ import pg from "pg";
 const { Pool } = pg;
 const app = express();
 
-// App Proxy friendly parsers
-app.use(express.urlencoded({ extended: false, limit: "1mb" }));
+/* -------------------------------------------------
+   Middleware
+------------------------------------------------- */
+
+app.use(express.urlencoded({ extended: true }));
 app.use(express.json({ limit: "1mb" }));
 
-// Prevent Shopify proxy returning HTML on long waits
-app.use((req, res, next) => {
-  res.setTimeout(12000, () => {
-    res.status(200).json({ ok: false, error: "Timeout. Please retry." });
-  });
-  next();
-});
+/* -------------------------------------------------
+   ENV
+------------------------------------------------- */
 
-// ENV
 const DATABASE_URL = process.env.DATABASE_URL || "";
 
 const pool = new Pool({
   connectionString: DATABASE_URL,
-  ssl: DATABASE_URL.includes("render.com") ? { rejectUnauthorized: false } : false
+  ssl: DATABASE_URL.includes("render.com")
+    ? { rejectUnauthorized: false }
+    : false
 });
 
-// ---------- helpers ----------
-function uid(prefix = "") {
-  return prefix + crypto.randomBytes(16).toString("hex");
-}
+/* -------------------------------------------------
+   DB Setup (NO position column)
+------------------------------------------------- */
 
-function sendJson(res, obj) {
-  // IMPORTANT: Always 200 so Shopify App Proxy does NOT swap response into HTML error pages
-  res.status(200);
-  res.set("Content-Type", "application/json; charset=utf-8");
-  res.send(JSON.stringify(obj));
-}
-
-function ok(res, obj = {}) {
-  return sendJson(res, { ok: true, ...obj });
-}
-
-function bad(res, msg = "Bad request", detail = "") {
-  return sendJson(res, {
-    ok: false,
-    error: msg,
-    ...(detail ? { error_detail: detail } : {})
-  });
-}
-
-function parseItems(req) {
-  let items = req.body?.items;
-
-  // items may arrive as a JSON string from URL-encoded posts
-  if (typeof items === "string") {
-    try {
-      items = JSON.parse(items);
-    } catch {
-      items = [];
-    }
-  }
-
-  items = Array.isArray(items) ? items : [];
-
-  const cleaned = [];
-  for (const it of items) {
-    const sku = String(it?.sku || "").trim();
-    let quantity = parseInt(it?.quantity, 10);
-    if (!sku) continue;
-    if (!quantity || quantity < 1) quantity = 1;
-    cleaned.push({ sku: sku.toUpperCase(), quantity });
-  }
-
-  // Merge duplicate SKUs
-  const map = new Map();
-  for (const it of cleaned) {
-    map.set(it.sku, (map.get(it.sku) || 0) + it.quantity);
-  }
-
-  let pos = 1;
-  return Array.from(map.entries()).map(([sku, quantity]) => ({
-    sku,
-    quantity,
-    position: pos++
-  }));
-}
-
-// ---------- DB init ----------
 async function ensureTables() {
-  // Backward-compatible schema:
-  // - created_at is required (your current DB enforces this)
-  // - updated_at is also present
   await pool.query(`
     CREATE TABLE IF NOT EXISTS lists (
       id TEXT PRIMARY KEY,
@@ -105,196 +44,310 @@ async function ensureTables() {
     CREATE TABLE IF NOT EXISTS list_items (
       id TEXT PRIMARY KEY,
       list_id TEXT NOT NULL,
-      sku TEXT NOT NULL,
-      quantity INT NOT NULL,
-      position INT NOT NULL
+      variant_id TEXT NOT NULL,
+      quantity INT NOT NULL
     );
   `);
-
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_lists_customer ON lists(customer_id);`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_items_list ON list_items(list_id);`);
-
-  // In case your DB was created before updated_at existed:
-  await pool.query(`ALTER TABLE lists ADD COLUMN IF NOT EXISTS updated_at BIGINT;`);
-  await pool.query(`UPDATE lists SET updated_at = created_at WHERE updated_at IS NULL;`);
 }
 
-// ---------- routes ----------
+/* -------------------------------------------------
+   Helpers
+------------------------------------------------- */
+
+function uid() {
+  return crypto.randomBytes(16).toString("hex");
+}
+
+function now() {
+  return Date.now();
+}
+
+/* -------------------------------------------------
+   Health Check
+------------------------------------------------- */
+
 app.get("/", (req, res) => {
   res.send("OK");
 });
 
-/**
- * APP PROXY ENDPOINT
- * App Proxy should point to:
- *   https://YOUR-RENDER-DOMAIN/proxy
- */
+/* -------------------------------------------------
+   PROXY ENDPOINT
+------------------------------------------------- */
+
 app.all("/proxy", async (req, res) => {
   try {
-    const action = String(req.query?.action || "").toLowerCase();
 
-    const customer_id = String(
-      req.query?.customer_id || req.body?.customer_id || ""
-    ).trim();
+    const action =
+      req.query.action ||
+      req.body.action ||
+      "";
 
-    if (!action) return bad(res, "Missing action");
-    if (!customer_id) return bad(res, "Missing customer_id");
+    const customerId =
+      req.query.customer_id ||
+      req.body.customer_id ||
+      "";
 
-    // --------- DEBUG: ECHO ----------
-    if (action === "echo") {
-      return ok(res, {
-        method: req.method,
-        query: req.query,
-        body_keys: Object.keys(req.body || {}),
-        body: req.body || null,
-        content_type: req.headers["content-type"] || null
-      });
+    if (!action) {
+      return res.json({ ok: false, error: "Missing action" });
     }
 
-    // ---------- LIST ----------
-    if (action === "list" && req.method === "GET") {
-      const { rows } = await pool.query(
-        `
-        SELECT
-          l.id,
-          l.name,
-          COALESCE(l.updated_at, l.created_at) AS updated_at,
-          COALESCE(COUNT(li.id), 0)::int AS items_count
-        FROM lists l
-        LEFT JOIN list_items li
-          ON li.list_id = l.id
-        WHERE l.customer_id = $1
-        GROUP BY l.id, l.name, l.updated_at, l.created_at
-        ORDER BY COALESCE(l.updated_at, l.created_at) DESC
-        `,
-        [customer_id]
-      );
-
-      return ok(res, { lists: rows });
+    if (!customerId) {
+      return res.json({ ok: false, error: "Missing customer_id" });
     }
 
-    // ---------- GET ----------
-    if (action === "get" && req.method === "GET") {
-      const list_id = String(req.query?.list_id || "").trim();
-      if (!list_id) return bad(res, "Missing list_id");
+    /* -------------------------------------------
+       LIST
+    ------------------------------------------- */
 
-      const { rows: lrows } = await pool.query(
-        `
-        SELECT id, name, COALESCE(updated_at, created_at) AS updated_at
-        FROM lists
-        WHERE id=$1 AND customer_id=$2
-        LIMIT 1
-        `,
-        [list_id, customer_id]
-      );
-      if (!lrows.length) return bad(res, "List not found");
+    if (action === "list") {
 
-      const { rows: irows } = await pool.query(
-        `
-        SELECT sku, quantity, position
-        FROM list_items
-        WHERE list_id=$1
-        ORDER BY position ASC
-        `,
-        [list_id]
+      const listsRes = await pool.query(
+        `SELECT * FROM lists
+         WHERE customer_id = $1
+         ORDER BY updated_at DESC`,
+        [customerId]
       );
 
-      return ok(res, {
+      const lists = [];
+
+      for (const row of listsRes.rows) {
+
+        const itemsRes = await pool.query(
+          `SELECT variant_id, quantity
+           FROM list_items
+           WHERE list_id = $1`,
+          [row.id]
+        );
+
+        lists.push({
+          id: row.id,
+          name: row.name,
+          created_at: row.created_at,
+          updated_at: row.updated_at,
+          items: itemsRes.rows
+        });
+      }
+
+      return res.json({ ok: true, lists });
+    }
+
+    /* -------------------------------------------
+       GET
+    ------------------------------------------- */
+
+    if (action === "get") {
+
+      const listId =
+        req.query.list_id ||
+        req.body.list_id;
+
+      if (!listId) {
+        return res.json({ ok: false, error: "Missing list_id" });
+      }
+
+      const listRes = await pool.query(
+        `SELECT * FROM lists
+         WHERE id = $1
+         AND customer_id = $2`,
+        [listId, customerId]
+      );
+
+      if (!listRes.rows.length) {
+        return res.json({ ok: false, error: "Not found" });
+      }
+
+      const itemsRes = await pool.query(
+        `SELECT variant_id, quantity
+         FROM list_items
+         WHERE list_id = $1`,
+        [listId]
+      );
+
+      return res.json({
+        ok: true,
         list: {
-          id: lrows[0].id,
-          name: lrows[0].name,
-          updated_at: lrows[0].updated_at,
-          items: irows.map(r => ({ sku: r.sku, quantity: r.quantity }))
+          id: listId,
+          name: listRes.rows[0].name,
+          items: itemsRes.rows
         }
       });
     }
 
-    // ---------- UPSERT (Option A fix: always set created_at + updated_at on insert) ----------
+    /* -------------------------------------------
+       UPSERT (CREATE / UPDATE)
+    ------------------------------------------- */
+
     if (action === "upsert" && req.method === "POST") {
-      const list_id_in = String(req.body?.list_id || "").trim();
-      const name = String(req.body?.name || "").trim();
-      if (!name) return bad(res, "Missing name");
 
-      const items = parseItems(req);
-      if (!items.length) return bad(res, "Please add at least one SKU + Qty.");
+      let {
+        list_id,
+        name,
+        items
+      } = req.body;
 
-      const list_id = list_id_in || uid("list_");
-      const now = Date.now();
+      if (!name) {
+        return res.json({ ok: false, error: "Missing name" });
+      }
 
-      // Insert sets created_at + updated_at; update preserves created_at automatically.
-      await pool.query(
-        `
-        INSERT INTO lists (id, customer_id, name, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5)
-        ON CONFLICT (id) DO UPDATE
-          SET name = EXCLUDED.name,
-              updated_at = EXCLUDED.updated_at
-        `,
-        [list_id, customer_id, name, now, now]
+      /* Parse items */
+      if (typeof items === "string") {
+        try {
+          items = JSON.parse(items);
+        } catch {
+          items = [];
+        }
+      }
+
+      items = Array.isArray(items) ? items : [];
+
+      const ts = now();
+
+      let listId = list_id || uid();
+
+      /* Insert / Update list */
+
+      const exists = await pool.query(
+        `SELECT id FROM lists WHERE id = $1`,
+        [listId]
       );
 
-      await pool.query(`DELETE FROM list_items WHERE list_id=$1`, [list_id]);
+      if (!exists.rows.length) {
 
-      for (const it of items) {
         await pool.query(
-          `
-          INSERT INTO list_items (id, list_id, sku, quantity, position)
-          VALUES ($1, $2, $3, $4, $5)
-          `,
-          [uid("itm_"), list_id, it.sku, it.quantity, it.position]
+          `INSERT INTO lists
+           (id, customer_id, name, created_at, updated_at)
+           VALUES ($1,$2,$3,$4,$5)`,
+          [listId, customerId, name, ts, ts]
+        );
+
+      } else {
+
+        await pool.query(
+          `UPDATE lists
+           SET name = $1,
+               updated_at = $2
+           WHERE id = $3
+           AND customer_id = $4`,
+          [name, ts, listId, customerId]
         );
       }
 
-      return ok(res, { list_id, updated_at: now, items_saved: items.length });
-    }
+      /* Replace items */
 
-    // ---------- DELETE ----------
-    if (action === "delete" && req.method === "POST") {
-      const list_id = String(req.body?.list_id || "").trim();
-      if (!list_id) return bad(res, "Missing list_id");
-
-      const { rows: owned } = await pool.query(
-        `SELECT id FROM lists WHERE id=$1 AND customer_id=$2 LIMIT 1`,
-        [list_id, customer_id]
+      await pool.query(
+        `DELETE FROM list_items WHERE list_id = $1`,
+        [listId]
       );
-      if (!owned.length) return bad(res, "List not found");
 
-      await pool.query(`DELETE FROM list_items WHERE list_id=$1`, [list_id]);
-      await pool.query(`DELETE FROM lists WHERE id=$1 AND customer_id=$2`, [list_id, customer_id]);
+      for (const it of items) {
 
-      return ok(res, { deleted: true });
+        if (!it.variant_id || !it.quantity) continue;
+
+        await pool.query(
+          `INSERT INTO list_items
+           (id, list_id, variant_id, quantity)
+           VALUES ($1,$2,$3,$4)`,
+          [uid(), listId, it.variant_id, it.quantity]
+        );
+      }
+
+      return res.json({ ok: true, id: listId });
     }
 
-    return bad(res, `Unsupported action/method. action=${action} method=${req.method}`);
+    /* -------------------------------------------
+       DELETE
+    ------------------------------------------- */
+
+    if (action === "delete" && req.method === "POST") {
+
+      const listId =
+        req.query.list_id ||
+        req.body.list_id;
+
+      if (!listId) {
+        return res.json({ ok: false, error: "Missing list_id" });
+      }
+
+      await pool.query(
+        `DELETE FROM list_items WHERE list_id = $1`,
+        [listId]
+      );
+
+      await pool.query(
+        `DELETE FROM lists
+         WHERE id = $1
+         AND customer_id = $2`,
+        [listId, customerId]
+      );
+
+      return res.json({ ok: true });
+    }
+
+    /* -------------------------------------------
+       ORDERIFY (FOR REORDER)
+    ------------------------------------------- */
+
+    if (action === "orderify") {
+
+      const listId =
+        req.query.list_id ||
+        req.body.list_id;
+
+      if (!listId) {
+        return res.json({ ok: false, error: "Missing list_id" });
+      }
+
+      const itemsRes = await pool.query(
+        `SELECT variant_id, quantity
+         FROM list_items
+         WHERE list_id = $1`,
+        [listId]
+      );
+
+      return res.json({
+        ok: true,
+        items: itemsRes.rows
+      });
+    }
+
+    /* -------------------------------------------
+       FALLBACK
+    ------------------------------------------- */
+
+    return res.json({
+      ok: false,
+      error: "Unsupported action/method"
+    });
+
   } catch (err) {
+
     console.error("Proxy error:", err);
 
-    const detail =
-      (err && err.stack) ? err.stack :
-      (err && err.message) ? err.message :
-      String(err);
-
-    return bad(res, "Server error", detail);
+    return res.status(500).json({
+      ok: false,
+      error: "Server error"
+    });
   }
 });
 
-// ---------- start ----------
+/* -------------------------------------------------
+   START
+------------------------------------------------- */
+
 const PORT = process.env.PORT || 3000;
 
 async function start() {
-  if (!DATABASE_URL) {
-    console.error("DATABASE_URL not set.");
-    process.exit(1);
+
+  if (DATABASE_URL) {
+    await ensureTables();
+    console.log("DB ready");
+  } else {
+    console.log("DATABASE_URL not set");
   }
 
-  await ensureTables();
-
   app.listen(PORT, () => {
-    console.log("Server running on port " + PORT);
+    console.log("Server running on " + PORT);
   });
 }
 
-start().catch((err) => {
-  console.error("Startup failed:", err);
-  process.exit(1);
-});
+start();
