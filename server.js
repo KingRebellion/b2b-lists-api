@@ -40,8 +40,9 @@ function ok(res, obj = {}) {
   return sendJson(res, 200, { ok: true, ...obj });
 }
 
-function bad(res, msg = "Bad request", status = 400) {
-  return sendJson(res, status, { ok: false, error: msg });
+function bad(res, msg = "Bad request") {
+  // IMPORTANT: App Proxy + Shopify can convert non-200 into HTML error pages.
+  return sendJson(res, 200, { ok: false, error: msg });
 }
 
 function parseItems(req) {
@@ -251,9 +252,10 @@ app.all("/proxy", async (req, res) => {
 
     return bad(res, `Unsupported action/method. action=${action} method=${req.method}`);
   } catch (err) {
-    console.error("Proxy error:", err);
-    return bad(res, "Server error", 500);
-  }
+  console.error("Proxy error:", err);
+  return sendJson(res, 200, { ok: false, error: "Server error" });
+}
+
 });
 
 // ---------- start ----------
