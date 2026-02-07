@@ -88,11 +88,15 @@ function parseItems(req) {
 
 // ---------- DB init ----------
 async function ensureTables() {
+  // Backward-compatible schema:
+  // - created_at is required (your current DB enforces this)
+  // - updated_at is also present
   await pool.query(`
     CREATE TABLE IF NOT EXISTS lists (
       id TEXT PRIMARY KEY,
       customer_id TEXT NOT NULL,
       name TEXT NOT NULL,
+      created_at BIGINT NOT NULL,
       updated_at BIGINT NOT NULL
     );
   `);
@@ -109,6 +113,10 @@ async function ensureTables() {
 
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_lists_customer ON lists(customer_id);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_items_list ON list_items(list_id);`);
+
+  // In case your DB was created before updated_at existed:
+  await pool.query(`ALTER TABLE lists ADD COLUMN IF NOT EXISTS updated_at BIGINT;`);
+  await pool.query(`UPDATE lists SET updated_at = created_at WHERE updated_at IS NULL;`);
 }
 
 // ---------- routes ----------
@@ -133,8 +141,6 @@ app.all("/proxy", async (req, res) => {
     if (!customer_id) return bad(res, "Missing customer_id");
 
     // --------- DEBUG: ECHO ----------
-    // GET /proxy?action=echo&customer_id=123
-    // POST /proxy?action=echo&customer_id=123 (with form body)
     if (action === "echo") {
       return ok(res, {
         method: req.method,
@@ -145,21 +151,21 @@ app.all("/proxy", async (req, res) => {
       });
     }
 
-    // ---------- LIST (FAST) ----------
+    // ---------- LIST ----------
     if (action === "list" && req.method === "GET") {
       const { rows } = await pool.query(
         `
         SELECT
           l.id,
           l.name,
-          l.updated_at,
+          COALESCE(l.updated_at, l.created_at) AS updated_at,
           COALESCE(COUNT(li.id), 0)::int AS items_count
         FROM lists l
         LEFT JOIN list_items li
           ON li.list_id = l.id
         WHERE l.customer_id = $1
-        GROUP BY l.id, l.name, l.updated_at
-        ORDER BY l.updated_at DESC
+        GROUP BY l.id, l.name, l.updated_at, l.created_at
+        ORDER BY COALESCE(l.updated_at, l.created_at) DESC
         `,
         [customer_id]
       );
@@ -174,7 +180,7 @@ app.all("/proxy", async (req, res) => {
 
       const { rows: lrows } = await pool.query(
         `
-        SELECT id, name, updated_at
+        SELECT id, name, COALESCE(updated_at, created_at) AS updated_at
         FROM lists
         WHERE id=$1 AND customer_id=$2
         LIMIT 1
@@ -203,7 +209,7 @@ app.all("/proxy", async (req, res) => {
       });
     }
 
-    // ---------- UPSERT ----------
+    // ---------- UPSERT (Option A fix: always set created_at + updated_at on insert) ----------
     if (action === "upsert" && req.method === "POST") {
       const list_id_in = String(req.body?.list_id || "").trim();
       const name = String(req.body?.name || "").trim();
@@ -213,17 +219,18 @@ app.all("/proxy", async (req, res) => {
       if (!items.length) return bad(res, "Please add at least one SKU + Qty.");
 
       const list_id = list_id_in || uid("list_");
-      const updated_at = Date.now();
+      const now = Date.now();
 
+      // Insert sets created_at + updated_at; update preserves created_at automatically.
       await pool.query(
         `
-        INSERT INTO lists (id, customer_id, name, updated_at)
-        VALUES ($1, $2, $3, $4)
+        INSERT INTO lists (id, customer_id, name, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5)
         ON CONFLICT (id) DO UPDATE
-          SET name=EXCLUDED.name,
-              updated_at=EXCLUDED.updated_at
+          SET name = EXCLUDED.name,
+              updated_at = EXCLUDED.updated_at
         `,
-        [list_id, customer_id, name, updated_at]
+        [list_id, customer_id, name, now, now]
       );
 
       await pool.query(`DELETE FROM list_items WHERE list_id=$1`, [list_id]);
@@ -238,7 +245,7 @@ app.all("/proxy", async (req, res) => {
         );
       }
 
-      return ok(res, { list_id, updated_at, items_saved: items.length });
+      return ok(res, { list_id, updated_at: now, items_saved: items.length });
     }
 
     // ---------- DELETE ----------
@@ -267,7 +274,6 @@ app.all("/proxy", async (req, res) => {
       (err && err.message) ? err.message :
       String(err);
 
-    // Still 200 JSON (Shopify-safe)
     return bad(res, "Server error", detail);
   }
 });
