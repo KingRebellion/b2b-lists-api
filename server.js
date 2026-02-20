@@ -208,6 +208,15 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
     }
 
     switch (action) {
+case "ping": {
+  return json(res, 200, {
+    ok: true,
+    action: "ping",
+    ts: nowIso(),
+    method,
+    customer_id: customerId,
+  });
+}
       case "list": {
         const listsRes = await pool.query(
           `
@@ -225,15 +234,7 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
           ORDER BY l.updated_at DESC
         `,
           [customerId]
-case "ping": {
-  return json(res, 200, {
-    ok: true,
-    action: "ping",
-    ts: nowIso(),
-    method,
-    customer_id: customerId,
-  });
-}
+
         );
 
         const lists = listsRes.rows.map((r) => ({
