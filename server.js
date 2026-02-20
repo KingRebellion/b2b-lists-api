@@ -3,10 +3,11 @@
 //
 // ENV required:
 //   DATABASE_URL
-//   SHOPIFY_APP_SECRET           (App Proxy secret)
-//   SHOPIFY_ADMIN_TOKEN          (Admin API access token - shpat_...)
+//   SHOPIFY_APP_SECRET
+//   SHOPIFY_SHOP
+//   SHOPIFY_ADMIN_TOKEN
+//
 // Optional:
-//   SHOPIFY_API_VERSION          (default 2025-01)
 //   PORT (default 3000)
 
 import express from "express";
@@ -18,18 +19,20 @@ const { Pool } = pg;
 const app = express();
 app.set("trust proxy", 1);
 
-// App Proxy often breaks with JSON bodies; keep urlencoded enabled.
+// IMPORTANT: App Proxy often breaks with JSON bodies; keep urlencoded enabled.
 app.use(express.urlencoded({ extended: false }));
 
 const PORT = process.env.PORT || 3000;
 const DATABASE_URL = process.env.DATABASE_URL;
 const SHOPIFY_APP_SECRET = process.env.SHOPIFY_APP_SECRET;
-const SHOPIFY_ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;
-const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || "2025-01";
+
+const SHOPIFY_SHOP = process.env.SHOPIFY_SHOP; // e.g. mississauga-hardware-wholesale.myshopify.com
+const SHOPIFY_ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN; // Admin API access token
 
 if (!DATABASE_URL) console.warn("Missing env DATABASE_URL");
 if (!SHOPIFY_APP_SECRET) console.warn("Missing env SHOPIFY_APP_SECRET");
-if (!SHOPIFY_ADMIN_TOKEN) console.warn("Missing env SHOPIFY_ADMIN_TOKEN (draftpad will fail)");
+if (!SHOPIFY_SHOP) console.warn("Missing env SHOPIFY_SHOP");
+if (!SHOPIFY_ADMIN_TOKEN) console.warn("Missing env SHOPIFY_ADMIN_TOKEN");
 
 const pool = new Pool({
   connectionString: DATABASE_URL,
@@ -101,7 +104,11 @@ function normalizeCustomerId(raw) {
   return s;
 }
 
-// Shopify App Proxy signature verification
+function nowIso() {
+  return Date.now().toString();
+}
+
+// ---------- Shopify App Proxy signature verification ----------
 function verifyAppProxy(req, res, next) {
   try {
     if (!SHOPIFY_APP_SECRET) return next();
@@ -117,7 +124,10 @@ function verifyAppProxy(req, res, next) {
       .map((k) => `${k}=${Array.isArray(q[k]) ? q[k].join(",") : q[k]}`)
       .join("");
 
-    const digest = crypto.createHmac("sha256", SHOPIFY_APP_SECRET).update(message).digest("hex");
+    const digest = crypto
+      .createHmac("sha256", SHOPIFY_APP_SECRET)
+      .update(message)
+      .digest("hex");
 
     const a = Buffer.from(digest, "utf8");
     const b = Buffer.from(provided, "utf8");
@@ -132,45 +142,45 @@ function verifyAppProxy(req, res, next) {
   }
 }
 
-function getShopDomain(req) {
-  const shop = (req.query.shop || "").toString().trim().toLowerCase();
-  // App proxy provides shop=xxxx.myshopify.com
-  if (!shop || !shop.endsWith(".myshopify.com")) return null;
-  // Basic safety
-  if (!/^[a-z0-9][a-z0-9-]*\.myshopify\.com$/.test(shop)) return null;
-  return shop;
-}
+// ---------- Shopify Admin GraphQL helper ----------
+async function shopifyGql(query, variables = {}) {
+  if (!SHOPIFY_SHOP || !SHOPIFY_ADMIN_TOKEN) {
+    throw new Error("Missing SHOPIFY_SHOP or SHOPIFY_ADMIN_TOKEN env vars");
+  }
 
-async function shopifyAdminPOST(shopDomain, path, payload) {
-  const url = `https://${shopDomain}/admin/api/${SHOPIFY_API_VERSION}/${path}`;
+  const url = `https://${SHOPIFY_SHOP}/admin/api/2025-01/graphql.json`;
+
   const r = await fetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN,
-      "Accept": "application/json",
     },
-    body: JSON.stringify(payload),
+    body: JSON.stringify({ query, variables }),
   });
 
   const text = await r.text();
-  let data = null;
-  try { data = JSON.parse(text); } catch {}
-
-  if (!r.ok) {
-    const errMsg =
-      (data && (data.errors || data.error)) ? JSON.stringify(data.errors || data.error)
-      : text.slice(0, 250);
-    throw new Error(`Shopify ${r.status}: ${errMsg}`);
+  let payload = null;
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    throw new Error(`Shopify non-JSON response (${r.status}): ${text.slice(0, 200)}`);
   }
 
-  if (!data) throw new Error("Shopify returned non-JSON");
-  return data;
+  if (!r.ok) {
+    throw new Error(`Shopify HTTP ${r.status}: ${JSON.stringify(payload).slice(0, 400)}`);
+  }
+
+  if (payload.errors && Array.isArray(payload.errors) && payload.errors.length) {
+    throw new Error(`Shopify GraphQL errors: ${JSON.stringify(payload.errors).slice(0, 400)}`);
+  }
+
+  return payload.data;
 }
 
 // ---------- routes ----------
-app.get("/health", (req, res) => json(res, 200, { ok: true, ts: Date.now() }));
-app.get("/proxy-ping/proxy", (req, res) => json(res, 200, { ok: true, pong: true, ts: Date.now() }));
+app.get("/health", (req, res) => json(res, 200, { ok: true, ts: nowIso() }));
+app.get("/proxy-ping/proxy", (req, res) => json(res, 200, { ok: true, pong: true, ts: nowIso() }));
 
 app.all("/proxy", verifyAppProxy, async (req, res) => {
   try {
@@ -186,7 +196,7 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
       orderify: ["GET"],
       upsert: ["POST"],
       delete: ["POST"],
-      draftpad: ["POST"],
+      draftpad: ["POST"], // ✅ added
     };
 
     if (!action || !allowed[action] || !allowed[action].includes(method)) {
@@ -204,7 +214,11 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
             l.id,
             l.name,
             EXTRACT(EPOCH FROM l.updated_at) * 1000 AS updated_at_ms,
-            (SELECT COUNT(*) FROM list_items li WHERE li.list_id = l.id) AS item_count
+            (
+              SELECT COUNT(*)
+              FROM list_items li
+              WHERE li.list_id = l.id
+            ) AS item_count
           FROM lists l
           WHERE l.customer_id = $1
           ORDER BY l.updated_at DESC
@@ -252,7 +266,9 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
         const list = {
           id: listRes.rows[0].id,
           name: listRes.rows[0].name,
-          updated_at: listRes.rows[0].updated_at_ms ? String(Math.trunc(listRes.rows[0].updated_at_ms)) : null,
+          updated_at: listRes.rows[0].updated_at_ms
+            ? String(Math.trunc(listRes.rows[0].updated_at_ms))
+            : null,
           items: itemsRes.rows.map((x) => ({ sku: x.sku, quantity: Number(x.quantity || 1) })),
         };
 
@@ -286,14 +302,22 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
 
             if (!up.rows.length) {
               const ins = await client.query(
-                `INSERT INTO lists (customer_id, name) VALUES ($1, $2) RETURNING id`,
+                `
+                INSERT INTO lists (customer_id, name)
+                VALUES ($1, $2)
+                RETURNING id
+              `,
                 [customerId, name]
               );
               listId = ins.rows[0].id;
             }
           } else {
             const ins = await client.query(
-              `INSERT INTO lists (customer_id, name) VALUES ($1, $2) RETURNING id`,
+              `
+              INSERT INTO lists (customer_id, name)
+              VALUES ($1, $2)
+              RETURNING id
+            `,
               [customerId, name]
             );
             listId = ins.rows[0].id;
@@ -309,7 +333,10 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
             params.push(listId, it.sku, it.quantity);
           }
 
-          await client.query(`INSERT INTO list_items (list_id, sku, quantity) VALUES ${values.join(",")}`, params);
+          await client.query(
+            `INSERT INTO list_items (list_id, sku, quantity) VALUES ${values.join(",")}`,
+            params
+          );
 
           await client.query("COMMIT");
           return json(res, 200, { ok: true, list_id: listId });
@@ -326,10 +353,10 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
         const listId = (req.body?.list_id || req.query.list_id || "").toString().trim();
         if (!listId) return json(res, 400, { ok: false, error: "Missing list_id" });
 
-        const del = await pool.query(`DELETE FROM lists WHERE id = $1 AND customer_id = $2 RETURNING id`, [
-          listId,
-          customerId,
-        ]);
+        const del = await pool.query(
+          `DELETE FROM lists WHERE id = $1 AND customer_id = $2 RETURNING id`,
+          [listId, customerId]
+        );
 
         if (!del.rows.length) return json(res, 404, { ok: false, error: "List not found" });
         return json(res, 200, { ok: true });
@@ -350,58 +377,67 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
           [listId]
         );
 
-        const items = itemsRes.rows.map((x) => ({ sku: x.sku, quantity: Number(x.quantity || 1) }));
+        const items = itemsRes.rows.map((x) => ({
+          sku: x.sku,
+          quantity: Number(x.quantity || 1),
+        }));
+
         return json(res, 200, { ok: true, items });
       }
 
       case "draftpad": {
-        // Creates a Draft Order with ONE $0 custom line item (required),
-        // and puts the pasted list into the draft note.
-        const shopDomain = getShopDomain(req);
-        if (!shopDomain) return json(res, 400, { ok: false, error: "Missing/invalid shop domain" });
-
-        if (!SHOPIFY_ADMIN_TOKEN) {
-          return json(res, 500, { ok: false, error: "Missing SHOPIFY_ADMIN_TOKEN" });
-        }
-
         const note = (req.body?.note || "").toString().trim();
         if (!note) return json(res, 400, { ok: false, error: "Missing note" });
 
-        // Optional: include customer_id in note header
-        const finalNote =
-          `Order Pad Submission\nCustomer ID: ${customerId}\n\n` + note;
+        const companyName = (req.body?.company_name || "").toString().trim();
+        const locationName = (req.body?.location_name || "").toString().trim();
 
-        // IMPORTANT: include at least one line item (custom line item at $0)
-        const payload = {
-          draft_order: {
-            note: finalNote,
-            tags: "Order Pad",
-            line_items: [
-              {
-                title: "Order Pad Submission",
-                quantity: 1,
-                original_unit_price: "0.00",
-              },
-            ],
-          },
+        let header = "Order Pad Submission";
+        header += `\nCustomer ID: ${customerId}`;
+        if (companyName) header += `\nCompany: ${companyName}`;
+        if (locationName) header += `\nLocation: ${locationName}`;
+
+        const finalNote = header + "\n\n" + note;
+
+        const mutation = `
+          mutation DraftOrderCreate($input: DraftOrderInput!) {
+            draftOrderCreate(input: $input) {
+              draftOrder { id name }
+              userErrors { field message }
+            }
+          }
+        `;
+
+        const input = {
+          customerId: `gid://shopify/Customer/${customerId}`,
+          note: finalNote,
+          tags: [
+            "Order Pad",
+            companyName ? `Company:${companyName}` : null,
+            locationName ? `Location:${locationName}` : null,
+          ].filter(Boolean),
+          lineItems: [
+            { title: "Order Pad Submission", quantity: 1, originalUnitPrice: "0.00" }
+          ],
         };
 
         try {
-          const data = await shopifyAdminPOST(shopDomain, "draft_orders.json", payload);
-          const draft = data?.draft_order;
+          const data = await shopifyGql(mutation, { input });
+          const resp = data?.draftOrderCreate;
+          const errs = resp?.userErrors || [];
 
-          if (!draft?.id) {
-            return json(res, 500, { ok: false, error: "Draft order not created" });
+          if (errs.length) {
+            return json(res, 200, { ok: false, error: errs.map(e => e.message).join("; ") });
           }
 
           return json(res, 200, {
             ok: true,
-            draft_order_id: draft.id,
-            draft_order_name: draft.name,
+            draft_order_id: resp?.draftOrder?.id || null,
+            draft_order_name: resp?.draftOrder?.name || null,
           });
         } catch (e) {
-          console.error("Draftpad failed:", e);
-          return json(res, 500, { ok: false, error: e.message || "Draft order not created" });
+          console.error("draftpad error:", e);
+          return json(res, 500, { ok: false, error: "Draft order not created" });
         }
       }
 
@@ -416,6 +452,4 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
 
 app.use((req, res) => json(res, 404, { ok: false, error: "Not found" }));
 
-app.listen(PORT, () => {
-  console.log(`Server listening on ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
