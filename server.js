@@ -187,8 +187,18 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
     const action = (req.query.action || req.query.actions || "").toString().trim();
     const method = req.method.toUpperCase();
 
-    const customerId = normalizeCustomerId(req.query.customer_id || req.body?.customer_id);
-    if (!customerId) return json(res, 400, { ok: false, error: "Missing customer_id" });
+ const action = (req.query.action || req.query.actions || "").toString().trim();
+const method = req.method.toUpperCase();
+
+// Prefer Shopify App Proxy logged_in_customer_id (most reliable + secure)
+const customerId =
+  normalizeCustomerId(req.query.logged_in_customer_id) ||
+  normalizeCustomerId(req.query.customer_id || req.body?.customer_id);
+
+// Allow ping without customer id (for debugging proxy reachability)
+if (action !== "ping" && !customerId) {
+  return json(res, 400, { ok: false, error: "Missing customer_id" });
+}
 
     const allowed = {
        ping: ["GET"],
@@ -212,9 +222,10 @@ case "ping": {
   return json(res, 200, {
     ok: true,
     action: "ping",
-    ts: nowIso(),
     method,
-    customer_id: customerId,
+    customer_id: customerId || null,
+    logged_in_customer_id: (req.query.logged_in_customer_id || null),
+    ts: nowIso(),
   });
 }
       case "list": {
