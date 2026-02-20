@@ -1,0 +1,1 @@
+shpat_[0-9a-zA-Z_]*==>REDACTED_TOKEN
