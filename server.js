@@ -406,41 +406,73 @@ case "ping": {
         return json(res, 200, { ok: true, items });
       }
 
-      case "draftpad": {
-        const note = (req.body?.note || "").toString().trim();
-        if (!note) return json(res, 400, { ok: false, error: "Missing note" });
+case "draftpad": {
+  const note = (req.body?.note || "").toString().trim();
+  if (!note) return json(res, 400, { ok: false, error: "Missing note" });
 
-        const companyName = (req.body?.company_name || "").toString().trim();
-        const locationName = (req.body?.location_name || "").toString().trim();
+  // These are OPTIONAL and come from Liquid/JS (recommended)
+  const companyName = (req.body?.company_name || "").toString().trim();
+  const locationName = (req.body?.location_name || "").toString().trim();
 
-        let header = "Order Pad Submission";
-        header += `\nCustomer ID: ${customerId}`;
-        if (companyName) header += `\nCompany: ${companyName}`;
-        if (locationName) header += `\nLocation: ${locationName}`;
+  // Shopify Admin API expects a GID for customer
+  // customerId here should be numeric like "1234567890"
+  const customerGid = customerId ? `gid://shopify/Customer/${customerId}` : null;
 
-        const finalNote = header + "\n\n" + note;
+  // Put company/location in the note (always safe)
+  let header = "Order Pad Submission";
+  if (customerId) header += `\nCustomer ID: ${customerId}`;
+  if (companyName) header += `\nCompany: ${companyName}`;
+  if (locationName) header += `\nLocation: ${locationName}`;
 
-        const mutation = `
-          mutation DraftOrderCreate($input: DraftOrderInput!) {
-            draftOrderCreate(input: $input) {
-              draftOrder { id name }
-              userErrors { field message }
-            }
-          }
-        `;
+  const finalNote = header + "\n\n" + note;
 
-        const input = {
-          customerId: `gid://shopify/Customer/${customerId}`,
-          note: finalNote,
-          tags: [
-            "Order Pad",
-            companyName ? `Company:${companyName}` : null,
-            locationName ? `Location:${locationName}` : null,
-          ].filter(Boolean),
-          lineItems: [
-            { title: "Order Pad Submission", quantity: 1, originalUnitPrice: "0.00" }
-          ],
-        };
+  // ✅ Create Draft Order
+  const mutation = `
+    mutation DraftOrderCreate($input: DraftOrderInput!) {
+      draftOrderCreate(input: $input) {
+        draftOrder { id name }
+        userErrors { field message }
+      }
+    }
+  `;
+
+  // Minimal input: attach customer + note
+  // (No payment terms as requested)
+  const input = {
+    note: finalNote,
+  };
+
+  // If we have a customer, attach it (helps admin context)
+  if (customerGid) input.customerId = customerGid;
+
+  // IMPORTANT: your shopifyGql likely needs the shop from query.shop (App Proxy includes it)
+  const shop = (req.query.shop || "").toString();
+  if (!shop) return json(res, 400, { ok: false, error: "Missing shop" });
+
+  const data = await shopifyGql(shop, mutation, { input });
+
+  const payload = data?.draftOrderCreate;
+  const errs = payload?.userErrors || [];
+
+  if (errs.length) {
+    return json(res, 200, {
+      ok: false,
+      error: "Draft order not created",
+      userErrors: errs,
+    });
+  }
+
+  const draft = payload?.draftOrder;
+  if (!draft?.id) {
+    return json(res, 200, { ok: false, error: "Draft order not created" });
+  }
+
+  return json(res, 200, {
+    ok: true,
+    draft_order_id: draft.id,
+    draft_order_name: draft.name,
+  });
+}
 
         try {
           const data = await shopifyGql(mutation, { input });
