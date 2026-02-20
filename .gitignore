@@ -1,2 +1,4 @@
 ﻿.env
 .env.*
+replacements.txt
+replacements*.txt
