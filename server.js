@@ -432,77 +432,96 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
       }
 
       case "draftpad": {
-        const note = (req.body?.note || "").toString().trim();
-        if (!note) return json(res, 400, { ok: false, error: "Missing note" });
+  const note = (req.body?.note || "").toString().trim();
+  if (!note) return json(res, 400, { ok: false, error: "Missing note" });
 
-        const shop = (req.query.shop || "").toString().trim();
-        if (!shop) return json(res, 400, { ok: false, error: "Missing shop" });
+  const shop = (req.query.shop || "").toString().trim();
+  if (!shop) return json(res, 400, { ok: false, error: "Missing shop" });
 
-        const companyName = (req.body?.company_name || "").toString().trim();
-        const locationName = (req.body?.location_name || "").toString().trim();
+  const companyName = (req.body?.company_name || "").toString().trim();
+  const locationName = (req.body?.location_name || "").toString().trim();
 
-        let header = "Order Pad Submission";
-        header += `\nCustomer ID: ${customerId}`;
-        if (companyName) header += `\nCompany: ${companyName}`;
-        if (locationName) header += `\nLocation: ${locationName}`;
+  let header = "Order Pad Submission";
+  header += `\nCustomer ID: ${customerId}`;
+  if (companyName) header += `\nCompany: ${companyName}`;
+  if (locationName) header += `\nLocation: ${locationName}`;
 
-        const finalNote = header + "\n\n" + note;
+  const finalNote = header + "\n\n" + note;
 
-        const mutation = `
-          mutation DraftOrderCreate($input: DraftOrderInput!) {
-            draftOrderCreate(input: $input) {
-              draftOrder { id name }
-              userErrors { field message }
-            }
-          }
-        `;
-
-        const input = {
-          note: finalNote,
-          // attaches customer for context (works even if you don’t set addresses)
-          customerId: `gid://shopify/Customer/${customerId}`,
-        };
-
-        let data;
-        try {
-          data = await shopifyGql(shop, mutation, { input });
-        } catch (err) {
-          console.error("Draftpad Admin API error:", err);
-          return json(res, 500, { ok: false, error: "Draft order not created" });
-        }
-
-        const payload = data?.draftOrderCreate;
-        const userErrors = payload?.userErrors || [];
-
-        if (userErrors.length) {
-          return json(res, 200, {
-            ok: false,
-            error: "Draft order not created",
-            userErrors,
-          });
-        }
-
-        const draft = payload?.draftOrder;
-        if (!draft?.id) {
-          return json(res, 200, { ok: false, error: "Draft order not created" });
-        }
-
-        return json(res, 200, {
-          ok: true,
-          draft_order_id: draft.id,
-          draft_order_name: draft.name,
-        });
+  const mutation = `
+    mutation DraftOrderCreate($input: DraftOrderInput!) {
+      draftOrderCreate(input: $input) {
+        draftOrder { id name }
+        userErrors { field message }
       }
-
-      default:
-        return json(res, 400, { ok: false, error: "Unsupported action" });
     }
-  } catch (e) {
-    console.error("Proxy handler error:", e);
-    return json(res, 500, { ok: false, error: "Server error" });
-  }
-});
+  `;
 
+  // Try with customerId first (best UX). If Shopify rejects it, we fallback without it.
+  const tryCreate = async (input) => {
+    const data = await shopifyGql(shop, mutation, { input });
+    const payload = data?.draftOrderCreate;
+    const userErrors = payload?.userErrors || [];
+    return { payload, userErrors };
+  };
+
+  try {
+    // 1) Attempt WITH customerId
+    const inputWithCustomer = {
+      note: finalNote,
+      customerId: `gid://shopify/Customer/${customerId}`,
+    };
+
+    let { payload, userErrors } = await tryCreate(inputWithCustomer);
+
+    // If Shopify complains about customerId (or anything), fallback WITHOUT customerId
+    if (userErrors.length) {
+      const customerErr = userErrors.some((e) => {
+        const f = Array.isArray(e.field) ? e.field.join(".") : String(e.field || "");
+        return f.includes("customer") || (e.message || "").toLowerCase().includes("customer");
+      });
+
+      if (customerErr) {
+        const inputNoCustomer = { note: finalNote };
+        const second = await tryCreate(inputNoCustomer);
+        payload = second.payload;
+        userErrors = second.userErrors;
+      }
+    }
+
+    // Return detailed info
+    if (userErrors.length) {
+      return json(res, 200, {
+        ok: false,
+        error: "Draft order not created",
+        userErrors,
+      });
+    }
+
+    const draft = payload?.draftOrder;
+    if (!draft?.id) {
+      return json(res, 200, {
+        ok: false,
+        error: "Draft order not created",
+        userErrors: [{ field: ["draftOrder"], message: "No draftOrder returned" }],
+      });
+    }
+
+    return json(res, 200, {
+      ok: true,
+      draft_order_id: draft.id,
+      draft_order_name: draft.name,
+    });
+  } catch (err) {
+    // IMPORTANT: return the real reason so you can fix it immediately
+    console.error("Draftpad Admin API error:", err);
+    return json(res, 500, {
+      ok: false,
+      error: "Draft order not created",
+      detail: err?.message ? String(err.message) : "Unknown error",
+    });
+  }
+}
 // Always JSON fallback
 app.use((req, res) => json(res, 404, { ok: false, error: "Not found" }));
 
