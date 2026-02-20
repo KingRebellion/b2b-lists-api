@@ -184,8 +184,7 @@ app.get("/proxy-ping/proxy", (req, res) => json(res, 200, { ok: true, pong: true
 
 app.all("/proxy", verifyAppProxy, async (req, res) => {
   try {
-    const action = (req.query.action || req.query.actions || "").toString().trim();
-    const method = req.method.toUpperCase();
+    
 
  const action = (req.query.action || req.query.actions || "").toString().trim();
 const method = req.method.toUpperCase();
