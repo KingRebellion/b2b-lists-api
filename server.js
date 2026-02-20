@@ -1,17 +1,16 @@
 // server.js (ESM) — Express + Postgres + Shopify App Proxy verification
 // Supports actions: list, get, upsert, delete, orderify, draftpad
 //
-// App Proxy URL patterns supported:
-//  - /proxy?action=list&customer_id=...
-//  - /proxy?actions=list&customer_id=...   (some earlier code used "actions")
+// App Proxy route (in Shopify app settings) should point to:
+//   https://YOUR-RENDER-APP.onrender.com/proxy
 //
 // ENV required:
 //   DATABASE_URL
-//   SHOPIFY_APP_SECRET         (App Proxy signature verification)
-//   SHOPIFY_ADMIN_TOKEN        (Admin API access token to create Draft Orders)
+//   SHOPIFY_APP_SECRET            (App Proxy secret / API secret key)
+//   SHOPIFY_ADMIN_TOKEN           (Admin API access token for THIS store)
+//   SHOPIFY_SHOP_DOMAIN           (e.g. mississauga-hardware-wholesale.myshopify.com)
 //
 // Optional:
-//   SHOPIFY_API_VERSION        (default "2024-07")
 //   PORT (default 3000)
 
 import express from "express";
@@ -23,18 +22,19 @@ const { Pool } = pg;
 const app = express();
 app.set("trust proxy", 1);
 
-// App Proxy often breaks with JSON bodies; keep urlencoded enabled.
+// App Proxy is most reliable with urlencoded
 app.use(express.urlencoded({ extended: false }));
 
 const PORT = process.env.PORT || 3000;
 const DATABASE_URL = process.env.DATABASE_URL;
 const SHOPIFY_APP_SECRET = process.env.SHOPIFY_APP_SECRET;
 const SHOPIFY_ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;
-const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || "2024-07";
+const SHOPIFY_SHOP_DOMAIN = process.env.SHOPIFY_SHOP_DOMAIN;
 
 if (!DATABASE_URL) console.warn("Missing env DATABASE_URL");
 if (!SHOPIFY_APP_SECRET) console.warn("Missing env SHOPIFY_APP_SECRET");
 if (!SHOPIFY_ADMIN_TOKEN) console.warn("Missing env SHOPIFY_ADMIN_TOKEN");
+if (!SHOPIFY_SHOP_DOMAIN) console.warn("Missing env SHOPIFY_SHOP_DOMAIN");
 
 const pool = new Pool({
   connectionString: DATABASE_URL,
@@ -45,7 +45,7 @@ const pool = new Pool({
 async function ensureSchema() {
   try {
     await pool.query(`CREATE EXTENSION IF NOT EXISTS pgcrypto;`);
-  } catch (e) {
+  } catch {
     // ignore if extensions are locked down
   }
 
@@ -59,7 +59,6 @@ async function ensureSchema() {
     );
   `);
 
-  // List items table (NO position, NO variant_id)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS list_items (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -115,67 +114,10 @@ function nowIso() {
   return Date.now().toString();
 }
 
-function normalizeShopDomain(shop) {
-  const s = String(shop || "").trim();
-  if (!s) return "";
-  if (/^[a-z0-9][a-z0-9-]*\.myshopify\.com$/i.test(s)) return s.toLowerCase();
-  return "";
-}
-
-// ---------- Shopify Admin GraphQL helper ----------
-async function shopifyGql(shop, query, variables = {}) {
-  const cleanShop = normalizeShopDomain(shop);
-  if (!cleanShop) throw new Error("Missing/invalid shop domain");
-  if (!SHOPIFY_ADMIN_TOKEN) throw new Error("Missing SHOPIFY_ADMIN_TOKEN");
-
-  const url = `https://${cleanShop}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`;
-
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Accept: "application/json",
-      "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN,
-    },
-    body: JSON.stringify({ query, variables }),
-  });
-
-  const text = await resp.text();
-
-  let parsed = null;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    const snippet = (text || "").replace(/\s+/g, " ").slice(0, 260);
-    throw new Error(`Non-JSON from Admin API (${resp.status}): ${snippet}`);
-  }
-
-  // HTTP error
-  if (!resp.ok) {
-    const msg =
-      (parsed?.errors && Array.isArray(parsed.errors) && parsed.errors[0]?.message) ||
-      parsed?.error ||
-      `Admin API HTTP ${resp.status}`;
-    throw new Error(msg);
-  }
-
-  // GraphQL top-level errors
-  if (parsed?.errors && Array.isArray(parsed.errors) && parsed.errors.length) {
-    const msg =
-      parsed.errors.map((e) => e?.message).filter(Boolean).join(" | ") || "GraphQL error";
-    throw new Error(msg);
-  }
-
-  return parsed?.data;
-}
-
 // ---------- Shopify App Proxy signature verification ----------
 function verifyAppProxy(req, res, next) {
   try {
-    if (!SHOPIFY_APP_SECRET) {
-      // Debug only; in production, require it.
-      return next();
-    }
+    if (!SHOPIFY_APP_SECRET) return next();
 
     const q = { ...req.query };
     const provided = (q.signature || "").toString();
@@ -188,10 +130,7 @@ function verifyAppProxy(req, res, next) {
       .map((k) => `${k}=${Array.isArray(q[k]) ? q[k].join(",") : q[k]}`)
       .join("");
 
-    const digest = crypto
-      .createHmac("sha256", SHOPIFY_APP_SECRET)
-      .update(message)
-      .digest("hex");
+    const digest = crypto.createHmac("sha256", SHOPIFY_APP_SECRET).update(message).digest("hex");
 
     const a = Buffer.from(digest, "utf8");
     const b = Buffer.from(provided, "utf8");
@@ -206,6 +145,64 @@ function verifyAppProxy(req, res, next) {
   }
 }
 
+// ---------- Shopify GraphQL helper (returns real errors) ----------
+async function shopifyGql(query, variables) {
+  if (!SHOPIFY_SHOP_DOMAIN || !SHOPIFY_ADMIN_TOKEN) {
+    return {
+      ok: false,
+      error: "Missing SHOPIFY_SHOP_DOMAIN or SHOPIFY_ADMIN_TOKEN",
+      status: 500,
+      raw: null,
+    };
+  }
+
+  const url = `https://${SHOPIFY_SHOP_DOMAIN}/admin/api/2025-01/graphql.json`;
+
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN,
+    },
+    body: JSON.stringify({ query, variables }),
+  });
+
+  const text = await resp.text();
+
+  // Handle cases where Shopify/proxy returns HTML
+  let payload = null;
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    return {
+      ok: false,
+      error: `Non-JSON from Shopify (${resp.status})`,
+      status: resp.status,
+      raw: text.slice(0, 600),
+    };
+  }
+
+  // GraphQL top-level errors can be array or undefined
+  const gqlErrors = Array.isArray(payload?.errors) ? payload.errors : [];
+
+  if (!resp.ok || gqlErrors.length) {
+    const msg =
+      gqlErrors
+        .map((e) => e?.message)
+        .filter(Boolean)
+        .join(" | ") || `Shopify error (${resp.status})`;
+
+    return {
+      ok: false,
+      error: msg,
+      status: resp.status,
+      raw: payload,
+    };
+  }
+
+  return { ok: true, status: resp.status, raw: payload };
+}
+
 // ---------- routes ----------
 app.get("/health", (req, res) => json(res, 200, { ok: true, ts: nowIso() }));
 
@@ -216,6 +213,7 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
     const action = (req.query.action || req.query.actions || "").toString().trim();
     const method = req.method.toUpperCase();
 
+    // allow customer_id in query OR body
     const customerId = normalizeCustomerId(req.query.customer_id || req.body?.customer_id);
     if (!customerId) return json(res, 400, { ok: false, error: "Missing customer_id" });
 
@@ -378,7 +376,7 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
         } catch (e) {
           await client.query("ROLLBACK");
           console.error("Upsert failed:", e);
-          return json(res, 500, { ok: false, error: "Server error" });
+          return json(res, 500, { ok: false, error: "Server error", detail: e?.message || "" });
         } finally {
           client.release();
         }
@@ -398,7 +396,6 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
         );
 
         if (!del.rows.length) return json(res, 404, { ok: false, error: "List not found" });
-
         return json(res, 200, { ok: true });
       }
 
@@ -437,22 +434,52 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
       }
 
       case "draftpad": {
-        // Creates Draft Order with note. Optionally sets customer.
+        // Creates Draft Order with note only (no payment terms)
+        // Accepts:
+        //   note (required)
+        //   company_name (optional)
+        //   location_name (optional)
+        //   customer_email (optional)
+        //   ship_* (optional: ship_first_name, ship_last_name, ship_address1, ship_address2, ship_city, ship_province, ship_zip, ship_country, ship_phone)
         const note = (req.body?.note || "").toString().trim();
         if (!note) return json(res, 400, { ok: false, error: "Missing note" });
 
-        const shop = (req.query.shop || "").toString().trim();
-        if (!shop) return json(res, 400, { ok: false, error: "Missing shop" });
-
         const companyName = (req.body?.company_name || "").toString().trim();
         const locationName = (req.body?.location_name || "").toString().trim();
+        const customerEmail = (req.body?.customer_email || "").toString().trim();
 
         let header = "Order Pad Submission";
         header += `\nCustomer ID: ${customerId}`;
         if (companyName) header += `\nCompany: ${companyName}`;
         if (locationName) header += `\nLocation: ${locationName}`;
+        if (customerEmail) header += `\nEmail: ${customerEmail}`;
 
         const finalNote = header + "\n\n" + note;
+
+        const shippingAddress = (() => {
+          const firstName = (req.body?.ship_first_name || "").toString().trim();
+          const lastName = (req.body?.ship_last_name || "").toString().trim();
+          const address1 = (req.body?.ship_address1 || "").toString().trim();
+          const city = (req.body?.ship_city || "").toString().trim();
+          const province = (req.body?.ship_province || "").toString().trim();
+          const zip = (req.body?.ship_zip || "").toString().trim();
+          const country = (req.body?.ship_country || "").toString().trim();
+
+          // only include if we have minimum usable fields
+          if (!address1 || !city || !country) return null;
+
+          return {
+            firstName: firstName || undefined,
+            lastName: lastName || undefined,
+            address1,
+            address2: (req.body?.ship_address2 || "").toString().trim() || undefined,
+            city,
+            province: province || undefined,
+            zip: zip || undefined,
+            country,
+            phone: (req.body?.ship_phone || "").toString().trim() || undefined,
+          };
+        })();
 
         const mutation = `
           mutation DraftOrderCreate($input: DraftOrderInput!) {
@@ -463,58 +490,58 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
           }
         `;
 
-        const tryCreate = async (input) => {
-          const data = await shopifyGql(shop, mutation, { input });
-          const payload = data?.draftOrderCreate;
-          const userErrors = Array.isArray(payload?.userErrors) ? payload.userErrors : [];
-          return { payload, userErrors };
+        const input = {
+          note: finalNote,
+          // email is fine even without customer assignment (Shopify uses it on draft)
+          ...(customerEmail ? { email: customerEmail } : {}),
+          ...(shippingAddress ? { shippingAddress } : {}),
         };
 
         try {
-          // Try with customerId first
-          const inputWithCustomer = {
-            note: finalNote,
-            customerId: `gid://shopify/Customer/${customerId}`,
-          };
+          const gql = await shopifyGql(mutation, { input });
 
-          let { payload, userErrors } = await tryCreate(inputWithCustomer);
-
-          // If Shopify rejects customerId (common if token lacks scopes), retry without
-          if (userErrors.length) {
-            const customerErr = userErrors.some((e) => {
-              const f = Array.isArray(e.field) ? e.field.join(".") : String(e.field || "");
-              return (
-                f.toLowerCase().includes("customer") ||
-                String(e.message || "").toLowerCase().includes("customer")
-              );
+          if (!gql.ok) {
+            return json(res, 500, {
+              ok: false,
+              error: gql.error || "Draft order not created",
+              detail:
+                typeof gql.raw === "string"
+                  ? gql.raw
+                  : JSON.stringify(gql.raw || {}).slice(0, 800),
             });
-
-            if (customerErr) {
-              const inputNoCustomer = { note: finalNote };
-              const second = await tryCreate(inputNoCustomer);
-              payload = second.payload;
-              userErrors = second.userErrors;
-            }
           }
 
+          const out = gql.raw?.data?.draftOrderCreate;
+          const userErrors = Array.isArray(out?.userErrors) ? out.userErrors : [];
+
+          // ✅ RETURN REAL userErrors (your UI will show these now)
           if (userErrors.length) {
-            return json(res, 200, { ok: false, error: "Draft order not created", userErrors });
+            const msg = userErrors
+              .map((e) => {
+                const field = Array.isArray(e.field) ? e.field.join(".") : "";
+                return (field ? `${field}: ` : "") + (e.message || "");
+              })
+              .filter(Boolean)
+              .join(" | ");
+
+            return json(res, 200, {
+              ok: false,
+              error: msg || "Draft order not created",
+              userErrors,
+            });
           }
 
-          const draft = payload?.draftOrder;
+          const draft = out?.draftOrder;
           if (!draft?.id) {
             return json(res, 200, {
               ok: false,
               error: "Draft order not created",
-              userErrors: [{ field: ["draftOrder"], message: "No draftOrder returned" }],
+              detail: "No draftOrder id returned",
+              raw: out || null,
             });
           }
 
-          return json(res, 200, {
-            ok: true,
-            draft_order_id: draft.id,
-            draft_order_name: draft.name,
-          });
+          return json(res, 200, { ok: true, draft: { id: draft.id, name: draft.name } });
         } catch (err) {
           console.error("Draftpad error:", err);
           return json(res, 500, {
@@ -530,7 +557,7 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
     }
   } catch (e) {
     console.error("Proxy handler error:", e);
-    return json(res, 500, { ok: false, error: "Server error" });
+    return json(res, 500, { ok: false, error: "Server error", detail: e?.message || "" });
   }
 });
 
