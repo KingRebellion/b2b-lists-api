@@ -1,74 +1,55 @@
-/**
- * server.js — Minimal Shopify App Proxy handler for OrderPad -> Draft Order
- *
- * ✅ Verifies Shopify App Proxy signature (HMAC)
- * ✅ Creates Draft Order with customerId + email (so Flow fields populate)
- *
- * ENV required:
- *   SHOPIFY_APP_SECRET=xxxxxxxxxxxxxxxxxxxx
- *   SHOPIFY_ADMIN_TOKEN=shpat_...
- *   PORT=10000 (Render sets automatically)
- *
- * Notes:
- * - Your Liquid sends x-www-form-urlencoded with:
- *   customer_id, customer_email, note, company_name, location_name
- * - Your JS calls:
- *   POST /apps/b2b-lists/proxy?action=draftpad&customer_id=...
- */
+// server.js (CommonJS)
+// npm i express
+// Node 18+ recommended (has global fetch)
 
-import crypto from "crypto";
-import express from "express";
+const crypto = require("crypto");
+const express = require("express");
 
-// Node 18+ has fetch built-in. If you're on older Node, install node-fetch and import it.
 const app = express();
 
-// App Proxy sends x-www-form-urlencoded
+// App Proxy posts x-www-form-urlencoded
 app.use(express.urlencoded({ extended: false }));
 
-/** ---------------------------
- *  Shopify App Proxy HMAC verify
- *  ---------------------------
- * Shopify App Proxy signs the querystring with `signature`.
- * You must compute signature from the query params (excluding signature)
- * and compare.
+/**
+ * Verify Shopify App Proxy signature
+ * App Proxy uses `signature` query param (not `hmac`).
  */
 function verifyAppProxySignature(req) {
   const secret = process.env.SHOPIFY_APP_SECRET;
   if (!secret) throw new Error("Missing env var: SHOPIFY_APP_SECRET");
 
-  // Shopify app proxy uses `signature` param (not `hmac`)
   const provided = (req.query.signature || "").toString();
   if (!provided) return false;
 
-  // Build message from query params except `signature`
-  // Sort keys and concatenate as key=value with no separators
   const keys = Object.keys(req.query)
     .filter((k) => k !== "signature")
     .sort();
 
   const message = keys
-    .map((k) => `${k}=${Array.isArray(req.query[k]) ? req.query[k][0] : req.query[k]}`)
+    .map((k) => {
+      const v = Array.isArray(req.query[k]) ? req.query[k][0] : req.query[k];
+      return `${k}=${v}`;
+    })
     .join("");
 
   const digest = crypto.createHmac("sha256", secret).update(message).digest("hex");
 
-  // Timing-safe compare
+  // timing safe compare
   const a = Buffer.from(digest, "utf8");
   const b = Buffer.from(provided, "utf8");
   if (a.length !== b.length) return false;
   return crypto.timingSafeEqual(a, b);
 }
 
-/** ---------------------------
- *  Shopify Admin GraphQL helper
- *  ---------------------------
+/**
+ * Shopify Admin GraphQL helper
  */
 async function shopifyGraphql(shop, query, variables) {
   const token = process.env.SHOPIFY_ADMIN_TOKEN;
   if (!token) throw new Error("Missing env var: SHOPIFY_ADMIN_TOKEN");
 
   if (!shop || !/\.myshopify\.com$/i.test(shop)) {
-    throw new Error("Invalid shop domain");
+    throw new Error(`Invalid shop domain: ${shop}`);
   }
 
   const url = `https://${shop}/admin/api/2025-01/graphql.json`;
@@ -90,30 +71,30 @@ async function shopifyGraphql(shop, query, variables) {
   if (json.errors?.length) {
     throw new Error(`Shopify GraphQL errors: ${JSON.stringify(json.errors)}`);
   }
+
   return json.data;
 }
 
-/** ---------------------------
- *  App Proxy route
- *  ---------------------------
- * Shopify will call this via:
- *   /apps/b2b-lists/proxy?...&signature=...
+/**
+ * One handler used by BOTH routes
  */
-app.post("/apps/b2b-lists/proxy", async (req, res) => {
+async function proxyHandler(req, res) {
   try {
-    // 1) Verify signature
+    // 1) Verify App Proxy signature
     const okSig = verifyAppProxySignature(req);
     if (!okSig) return res.status(401).json({ ok: false, error: "Invalid proxy signature" });
 
-    // 2) Ensure correct action
+    // 2) Check action
     const action = (req.query.action || "").toString();
     if (action !== "draftpad") {
-      return res.status(400).json({ ok: false, error: "Unknown action" });
+      return res.status(400).json({ ok: false, error: `Unknown action: ${action}` });
     }
 
-    // 3) Extract inputs
-    const shop = (req.query.shop || "").toString(); // App Proxy includes shop=xxx.myshopify.com
-    const customerId = (req.body.customer_id || "").toString().trim(); // usually gid://shopify/Customer/123...
+    // 3) Inputs
+    const shop = (req.query.shop || "").toString();
+
+    // From your Liquid POST body
+    const customerId = (req.body.customer_id || "").toString().trim(); // likely gid://shopify/Customer/...
     const customerEmail = (req.body.customer_email || "").toString().trim();
     const noteRaw = (req.body.note || "").toString();
 
@@ -121,10 +102,10 @@ app.post("/apps/b2b-lists/proxy", async (req, res) => {
     const locationName = (req.body.location_name || "").toString();
 
     if (!noteRaw.trim()) {
-      return res.status(400).json({ ok: false, error: "Missing note (orderpad list)" });
+      return res.status(400).json({ ok: false, error: "Missing note (pasted list)" });
     }
 
-    // 4) Build note (add context)
+    // Add context into note so your team can see what came from where
     const note = [
       "OrderPad Draft",
       companyName ? `Company: ${companyName}` : null,
@@ -137,7 +118,7 @@ app.post("/apps/b2b-lists/proxy", async (req, res) => {
       .filter(Boolean)
       .join("\n");
 
-    // 5) Create Draft Order with customerId + email attached
+    // 4) Create Draft Order WITH customer attached (this is the key fix)
     const mutation = `
       mutation DraftCreate($input: DraftOrderInput!) {
         draftOrderCreate(input: $input) {
@@ -154,7 +135,7 @@ app.post("/apps/b2b-lists/proxy", async (req, res) => {
 
     const variables = {
       input: {
-        // ✅ This is the key fix: attach customer/email at creation time
+        // ✅ Attach these so Shopify Flow can see customer/email on draft
         customerId: customerId || null,
         email: customerEmail || null,
 
@@ -163,9 +144,9 @@ app.post("/apps/b2b-lists/proxy", async (req, res) => {
     };
 
     const data = await shopifyGraphql(shop, mutation, variables);
-    const result = data?.draftOrderCreate;
+    const payload = data?.draftOrderCreate;
 
-    const userErrors = result?.userErrors || [];
+    const userErrors = payload?.userErrors || [];
     if (userErrors.length) {
       return res.status(400).json({
         ok: false,
@@ -173,7 +154,7 @@ app.post("/apps/b2b-lists/proxy", async (req, res) => {
       });
     }
 
-    const draft = result?.draftOrder;
+    const draft = payload?.draftOrder;
     return res.json({
       ok: true,
       draft_id: draft?.id,
@@ -182,16 +163,17 @@ app.post("/apps/b2b-lists/proxy", async (req, res) => {
       customer_email: draft?.customer?.email,
     });
   } catch (err) {
-    console.error("draftpad error:", err);
+    console.error("Proxy draftpad error:", err);
     return res.status(500).json({ ok: false, error: err.message || "Server error" });
   }
-});
+}
 
-/** ---------------------------
- *  Health check
- *  ---------------------------
- */
+// ✅ Support BOTH paths:
+app.post("/apps/b2b-lists/proxy", proxyHandler);
+app.post("/proxy", proxyHandler);
+
+// Health check
 app.get("/health", (req, res) => res.status(200).send("ok"));
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`Server listening on ${port}`));
+app.listen(port, () => console.log(`Listening on ${port}`));
