@@ -1,15 +1,16 @@
 // server.js (ESM) — Express + Postgres + Shopify App Proxy verification
-// Supports actions: list, get, upsert, delete, orderify, draftpad, ping
+// Supports actions: list, get, upsert, delete, orderify, draftpad
 //
 // ENV required:
 //   DATABASE_URL
 //   SHOPIFY_APP_SECRET
 //
-// Draft order (Order Pad) ENV required:
-//   SHOPIFY_STORE_DOMAIN (e.g. mississauga-hardware-wholesale.myshopify.com)
-//   SHOPIFY_ADMIN_ACCESS_TOKEN (shpat_...)
-
-// Node 18+ has global fetch.
+// For draftpad (Draft Orders):
+//   SHOPIFY_ADMIN_TOKEN
+//   SHOPIFY_SHOP_DOMAIN        (e.g. mississauga-hardware-wholesale.myshopify.com)
+//
+// Optional:
+//   PORT (default 3000)
 
 import express from "express";
 import crypto from "crypto";
@@ -20,29 +21,34 @@ const { Pool } = pg;
 const app = express();
 app.set("trust proxy", 1);
 
-// App Proxy is most reliable with urlencoded bodies
+// App Proxy + Shopify forms prefer urlencoded
 app.use(express.urlencoded({ extended: false }));
 
 const PORT = process.env.PORT || 3000;
 const DATABASE_URL = process.env.DATABASE_URL;
 const SHOPIFY_APP_SECRET = process.env.SHOPIFY_APP_SECRET;
 
-const SHOPIFY_STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN; // mississauga-hardware-wholesale.myshopify.com
-const SHOPIFY_ADMIN_ACCESS_TOKEN = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN; // shpat_...
+// Draft orders
+const SHOPIFY_ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;
+const SHOPIFY_SHOP_DOMAIN = process.env.SHOPIFY_SHOP_DOMAIN;
 
 if (!DATABASE_URL) console.warn("Missing env DATABASE_URL");
 if (!SHOPIFY_APP_SECRET) console.warn("Missing env SHOPIFY_APP_SECRET");
+if (!SHOPIFY_ADMIN_TOKEN) console.warn("Missing env SHOPIFY_ADMIN_TOKEN (draftpad will fail)");
+if (!SHOPIFY_SHOP_DOMAIN) console.warn("Missing env SHOPIFY_SHOP_DOMAIN (draftpad will fail)");
 
 const pool = new Pool({
   connectionString: DATABASE_URL,
   ssl: process.env.NODE_ENV === "production" ? { rejectUnauthorized: false } : false,
 });
 
-// ---------- DB init (idempotent) ----------
+// ---------- DB init (safe, idempotent) ----------
 async function ensureSchema() {
   try {
     await pool.query(`CREATE EXTENSION IF NOT EXISTS pgcrypto;`);
-  } catch (_) {}
+  } catch (e) {
+    // ignore if extension not allowed
+  }
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS lists (
@@ -68,6 +74,7 @@ async function ensureSchema() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_lists_customer_id ON lists(customer_id);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_list_items_list_id ON list_items(list_id);`);
 }
+
 ensureSchema().catch((e) => console.error("Schema init failed:", e));
 
 // ---------- helpers ----------
@@ -75,6 +82,14 @@ function json(res, status, obj) {
   res.status(status);
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   res.send(JSON.stringify(obj));
+}
+
+function normalizeCustomerId(raw) {
+  if (raw == null) return null;
+  const s = String(raw).trim();
+  if (!s) return null;
+  if (!/^\d+$/.test(s)) return null;
+  return s;
 }
 
 function safeParseItems(itemsStr) {
@@ -94,14 +109,6 @@ function safeParseItems(itemsStr) {
   }
 }
 
-function normalizeCustomerId(raw) {
-  if (raw == null) return null;
-  const s = String(raw).trim();
-  if (!s) return null;
-  if (!/^\d+$/.test(s)) return null;
-  return s;
-}
-
 // Shopify App Proxy signature verification
 function verifyAppProxy(req, res, next) {
   try {
@@ -113,16 +120,13 @@ function verifyAppProxy(req, res, next) {
 
     delete q.signature;
 
-    // message = sorted key=value (no separators) — Shopify App Proxy rule
+    // Shopify expects: sorted keys, concat "key=value" with NO separators
     const message = Object.keys(q)
       .sort()
       .map((k) => `${k}=${Array.isArray(q[k]) ? q[k].join(",") : q[k]}`)
       .join("");
 
-    const digest = crypto
-      .createHmac("sha256", SHOPIFY_APP_SECRET)
-      .update(message)
-      .digest("hex");
+    const digest = crypto.createHmac("sha256", SHOPIFY_APP_SECRET).update(message).digest("hex");
 
     const a = Buffer.from(digest, "utf8");
     const b = Buffer.from(provided, "utf8");
@@ -137,56 +141,52 @@ function verifyAppProxy(req, res, next) {
   }
 }
 
-async function shopifyAdminGql(query, variables) {
-  if (!SHOPIFY_STORE_DOMAIN || !SHOPIFY_ADMIN_ACCESS_TOKEN) {
-    throw new Error("Missing SHOPIFY_STORE_DOMAIN or SHOPIFY_ADMIN_ACCESS_TOKEN");
+app.get("/health", (req, res) => json(res, 200, { ok: true }));
+app.get("/proxy-ping/proxy", (req, res) =>
+  json(res, 200, { ok: true, pong: true, shop: req.query.shop || null, path_prefix: req.query.path_prefix || null })
+);
+
+// ---------- Shopify Admin GraphQL helper ----------
+async function shopifyGraphQL(query, variables) {
+  if (!SHOPIFY_ADMIN_TOKEN || !SHOPIFY_SHOP_DOMAIN) {
+    return { ok: false, error: "Missing SHOPIFY_ADMIN_TOKEN or SHOPIFY_SHOP_DOMAIN" };
   }
 
-  const url = `https://${SHOPIFY_STORE_DOMAIN}/admin/api/2024-07/graphql.json`;
+  const url = `https://${SHOPIFY_SHOP_DOMAIN}/admin/api/2025-01/graphql.json`;
 
   const r = await fetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "X-Shopify-Access-Token": SHOPIFY_ADMIN_ACCESS_TOKEN,
-      "Accept": "application/json",
+      "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN,
     },
     body: JSON.stringify({ query, variables }),
   });
 
   const text = await r.text();
-  let data;
+  let data = null;
   try {
     data = JSON.parse(text);
-  } catch {
-    throw new Error(`Admin GQL Non-JSON (${r.status}): ${text.slice(0, 200)}`);
+  } catch (e) {
+    return { ok: false, error: `Admin API Non-JSON (${r.status}): ${text.slice(0, 200)}` };
   }
 
   if (!r.ok) {
-    throw new Error(`Admin GQL HTTP ${r.status}: ${JSON.stringify(data).slice(0, 300)}`);
+    return { ok: false, error: `Admin API HTTP ${r.status}`, details: data };
   }
 
-  return data;
+  if (data.errors && data.errors.length) {
+    return { ok: false, error: "Admin API GraphQL errors", details: data.errors };
+  }
+
+  return { ok: true, data };
 }
 
-// ---------- routes ----------
-app.get("/health", (req, res) => json(res, 200, { ok: true }));
-
-// Main App Proxy endpoint
+// ---------- main App Proxy endpoint ----------
 app.all("/proxy", verifyAppProxy, async (req, res) => {
   try {
     const action = (req.query.action || req.query.actions || "").toString().trim();
     const method = req.method.toUpperCase();
-
-    // Allow ping WITHOUT customer_id (to debug proxy wiring)
-    if (action === "ping" && method === "GET") {
-      return json(res, 200, {
-        ok: true,
-        pong: true,
-        shop: req.query.shop || null,
-        path_prefix: req.query.path_prefix || null,
-      });
-    }
 
     const customerId = normalizeCustomerId(req.query.customer_id || req.body?.customer_id);
     if (!customerId) return json(res, 400, { ok: false, error: "Missing customer_id" });
@@ -215,11 +215,7 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
             l.id,
             l.name,
             EXTRACT(EPOCH FROM l.updated_at) * 1000 AS updated_at_ms,
-            (
-              SELECT COUNT(*)
-              FROM list_items li
-              WHERE li.list_id = l.id
-            ) AS item_count
+            (SELECT COUNT(*) FROM list_items li WHERE li.list_id = l.id) AS item_count
           FROM lists l
           WHERE l.customer_id = $1
           ORDER BY l.updated_at DESC
@@ -264,17 +260,14 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
           [listId]
         );
 
-        return json(res, 200, {
-          ok: true,
-          list: {
-            id: listRes.rows[0].id,
-            name: listRes.rows[0].name,
-            updated_at: listRes.rows[0].updated_at_ms
-              ? String(Math.trunc(listRes.rows[0].updated_at_ms))
-              : null,
-            items: itemsRes.rows.map((x) => ({ sku: x.sku, quantity: Number(x.quantity || 1) })),
-          },
-        });
+        const list = {
+          id: listRes.rows[0].id,
+          name: listRes.rows[0].name,
+          updated_at: listRes.rows[0].updated_at_ms ? String(Math.trunc(listRes.rows[0].updated_at_ms)) : null,
+          items: itemsRes.rows.map((x) => ({ sku: x.sku, quantity: Number(x.quantity || 1) })),
+        };
+
+        return json(res, 200, { ok: true, list });
       }
 
       case "upsert": {
@@ -327,10 +320,7 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
             params.push(listId, it.sku, it.quantity);
           }
 
-          await client.query(
-            `INSERT INTO list_items (list_id, sku, quantity) VALUES ${values.join(",")}`,
-            params
-          );
+          await client.query(`INSERT INTO list_items (list_id, sku, quantity) VALUES ${values.join(",")}`, params);
 
           await client.query("COMMIT");
           return json(res, 200, { ok: true, list_id: listId });
@@ -347,13 +337,12 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
         const listId = (req.body?.list_id || req.query.list_id || "").toString().trim();
         if (!listId) return json(res, 400, { ok: false, error: "Missing list_id" });
 
-        const del = await pool.query(
-          `DELETE FROM lists WHERE id = $1 AND customer_id = $2 RETURNING id`,
-          [listId, customerId]
-        );
+        const del = await pool.query(`DELETE FROM lists WHERE id = $1 AND customer_id = $2 RETURNING id`, [
+          listId,
+          customerId,
+        ]);
 
         if (!del.rows.length) return json(res, 404, { ok: false, error: "List not found" });
-
         return json(res, 200, { ok: true });
       }
 
@@ -372,41 +361,44 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
           [listId]
         );
 
-        return json(res, 200, {
-          ok: true,
-          items: itemsRes.rows.map((x) => ({ sku: x.sku, quantity: Number(x.quantity || 1) })),
-        });
+        const items = itemsRes.rows.map((x) => ({ sku: x.sku, quantity: Number(x.quantity || 1) }));
+        return json(res, 200, { ok: true, items });
       }
 
+      // ---------------- DRAFTPAD ----------------
       case "draftpad": {
+        // IMPORTANT: always return JSON (never crash)
         const note = (req.body?.note || "").toString().trim();
         if (!note) return json(res, 400, { ok: false, error: "Missing note" });
 
+        // extra fields (optional)
         const companyName = (req.body?.company_name || "").toString().trim();
         const locationName = (req.body?.location_name || "").toString().trim();
         const customerEmail = (req.body?.customer_email || "").toString().trim();
 
-        // Shipping fields (optional)
-        const ship = {
-          firstName: (req.body?.ship_first_name || "").toString().trim(),
-          lastName: (req.body?.ship_last_name || "").toString().trim(),
-          address1: (req.body?.ship_address1 || "").toString().trim(),
-          address2: (req.body?.ship_address2 || "").toString().trim(),
-          city: (req.body?.ship_city || "").toString().trim(),
-          province: (req.body?.ship_province || "").toString().trim(),
-          zip: (req.body?.ship_zip || "").toString().trim(),
-          country: (req.body?.ship_country || "").toString().trim(),
-          phone: (req.body?.ship_phone || "").toString().trim(),
+        // shipping (optional)
+        const shippingAddress = {
+          firstName: (req.body?.ship_first_name || "").toString().trim() || undefined,
+          lastName: (req.body?.ship_last_name || "").toString().trim() || undefined,
+          address1: (req.body?.ship_address1 || "").toString().trim() || undefined,
+          address2: (req.body?.ship_address2 || "").toString().trim() || undefined,
+          city: (req.body?.ship_city || "").toString().trim() || undefined,
+          province: (req.body?.ship_province || "").toString().trim() || undefined,
+          zip: (req.body?.ship_zip || "").toString().trim() || undefined,
+          country: (req.body?.ship_country || "").toString().trim() || undefined,
+          phone: (req.body?.ship_phone || "").toString().trim() || undefined,
         };
 
+        // Build note header
         let header = "Order Pad Submission";
         header += `\nCustomer ID: ${customerId}`;
-        if (customerEmail) header += `\nEmail: ${customerEmail}`;
         if (companyName) header += `\nCompany: ${companyName}`;
         if (locationName) header += `\nLocation: ${locationName}`;
+        if (customerEmail) header += `\nEmail: ${customerEmail}`;
 
         const finalNote = header + "\n\n" + note;
 
+        // Draft Order Create
         const mutation = `
           mutation DraftOrderCreate($input: DraftOrderInput!) {
             draftOrderCreate(input: $input) {
@@ -416,44 +408,33 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
           }
         `;
 
+        // Only include shippingAddress if it has the minimum fields
+        const hasShipping =
+          !!shippingAddress.address1 && !!shippingAddress.city && !!shippingAddress.country;
+
         const input = {
           note: finalNote,
+          // Email helps your team identify the draft quickly
+          ...(customerEmail ? { email: customerEmail } : {}),
+          ...(hasShipping ? { shippingAddress } : {}),
+          // No lineItems (you said note-only is fine)
         };
 
-        // If we have enough shipping info, attach it
-        if (ship.address1 && ship.city && ship.country) {
-          input.shippingAddress = {
-            firstName: ship.firstName || undefined,
-            lastName: ship.lastName || undefined,
-            address1: ship.address1,
-            address2: ship.address2 || undefined,
-            city: ship.city,
-            province: ship.province || undefined,
-            zip: ship.zip || undefined,
-            country: ship.country,
-            phone: ship.phone || undefined,
-          };
-        }
-
-        try {
-          const resp = await shopifyAdminGql(mutation, { input });
-          const payload = resp?.data?.draftOrderCreate;
-
-          const errors = payload?.userErrors || [];
-          if (errors.length) {
-            return json(res, 200, { ok: false, error: errors.map(e => e.message).join("; ") });
-          }
-
-          const draft = payload?.draftOrder;
-          if (!draft?.id) {
-            return json(res, 200, { ok: false, error: "Draft order not created" });
-          }
-
-          return json(res, 200, { ok: true, draft_id: draft.id, draft_name: draft.name });
-        } catch (e) {
-          console.error("draftpad failed:", e);
+        const resp = await shopifyGraphQL(mutation, { input });
+        if (!resp.ok) {
+          console.error("draftpad shopifyGraphQL failed:", resp);
           return json(res, 500, { ok: false, error: "Draft order not created" });
         }
+
+        const out = resp.data?.data?.draftOrderCreate;
+        const errs = out?.userErrors || [];
+        if (errs.length) {
+          console.error("draftpad userErrors:", errs);
+          return json(res, 400, { ok: false, error: errs[0]?.message || "Draft order not created" });
+        }
+
+        const draft = out?.draftOrder;
+        return json(res, 200, { ok: true, draft_id: draft?.id || null, name: draft?.name || null });
       }
 
       default:
@@ -465,6 +446,7 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
   }
 });
 
+// Fallback 404 JSON
 app.use((req, res) => json(res, 404, { ok: false, error: "Not found" }));
 
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
