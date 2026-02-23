@@ -205,7 +205,7 @@ function verifyAppProxy(req, res, next) {
 app.get("/health", (req, res) => json(res, 200, { ok: true, ts: nowIso() }));
 app.get("/proxy-ping/proxy", (req, res) => json(res, 200, { ok: true, pong: true, ts: nowIso() }));
 
-app.all("/proxy", verifyAppProxy, async (req, res) => {
+app.all(["/proxy", "/proxy/*"], verifyAppProxy, async (req, res) => {
   try {
     const action = (req.query.action || req.query.actions || "").toString().trim();
     const method = req.method.toUpperCase();
@@ -229,6 +229,12 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
       });
     }
 
+    // ... keep ALL your existing switch(action) code here unchanged ...
+  } catch (e) {
+    console.error("Proxy handler error:", e);
+    return json(res, 500, { ok: false, error: "Server error" });
+  }
+});
     switch (action) {
       case "list": {
         const listsRes = await pool.query(
