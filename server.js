@@ -1,25 +1,17 @@
 // server.js (ESM) — Express + Postgres + Shopify App Proxy verification
-// Actions supported:
-//  - list    (GET)    : list saved lists for customer_id
-//  - get     (GET)    : get one list + items
-//  - upsert  (POST)   : create/update list (items = JSON string [{sku,quantity}])
-//  - delete  (POST)   : delete list
-//  - orderify (GET)   : return list items (sku, quantity) for storefront resolver
-//  - draftpad (POST)  : create Draft Order with note as-is + $0 customLineItem (NO SKU parsing)
+// Supports actions: list, get, upsert, delete, orderify, draftpad
 //
-// App Proxy endpoint mounted at /proxy
-// Your Shopify App Proxy path should map to: https://<your-render-domain>/proxy
+// App Proxy endpoint: /proxy
+// Your Shopify proxy URL should be: https://YOUR-STORE.myshopify.com/apps/b2b-lists/proxy
 //
 // ENV required:
 //   DATABASE_URL
-//   SHOPIFY_APP_SECRET                (App Proxy secret)
-//   SHOPIFY_SHOP_DOMAIN               (e.g. mississauga-hardware-wholesale.myshopify.com)
-//   SHOPIFY_ADMIN_ACCESS_TOKEN        (Admin API access token with write_draft_orders)
+//   SHOPIFY_APP_SECRET
+//   SHOPIFY_STORE_DOMAIN          (e.g. mississauga-hardware-wholesale.myshopify.com)
+//   SHOPIFY_ADMIN_ACCESS_TOKEN    (Admin API access token)
 //
 // Optional:
-//   SHOPIFY_API_VERSION (default 2024-10)
 //   PORT (default 3000)
-//   NODE_ENV=production (enables SSL config for PG)
 
 import express from "express";
 import crypto from "crypto";
@@ -30,20 +22,18 @@ const { Pool } = pg;
 const app = express();
 app.set("trust proxy", 1);
 
-// IMPORTANT: App Proxy + many themes behave best with urlencoded bodies.
+// IMPORTANT: App Proxy often breaks with JSON bodies; keep urlencoded enabled.
 app.use(express.urlencoded({ extended: false }));
 
 const PORT = process.env.PORT || 3000;
-
 const DATABASE_URL = process.env.DATABASE_URL;
 const SHOPIFY_APP_SECRET = process.env.SHOPIFY_APP_SECRET;
-const SHOPIFY_SHOP_DOMAIN = process.env.SHOPIFY_SHOP_DOMAIN;
+const SHOPIFY_STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN;
 const SHOPIFY_ADMIN_ACCESS_TOKEN = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
-const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || "2024-10";
 
 if (!DATABASE_URL) console.warn("Missing env DATABASE_URL");
-if (!SHOPIFY_APP_SECRET) console.warn("Missing env SHOPIFY_APP_SECRET (App Proxy secret)");
-if (!SHOPIFY_SHOP_DOMAIN) console.warn("Missing env SHOPIFY_SHOP_DOMAIN");
+if (!SHOPIFY_APP_SECRET) console.warn("Missing env SHOPIFY_APP_SECRET");
+if (!SHOPIFY_STORE_DOMAIN) console.warn("Missing env SHOPIFY_STORE_DOMAIN");
 if (!SHOPIFY_ADMIN_ACCESS_TOKEN) console.warn("Missing env SHOPIFY_ADMIN_ACCESS_TOKEN");
 
 const pool = new Pool({
@@ -55,7 +45,7 @@ const pool = new Pool({
 async function ensureSchema() {
   try {
     await pool.query(`CREATE EXTENSION IF NOT EXISTS pgcrypto;`);
-  } catch {
+  } catch (e) {
     // ignore if locked down
   }
 
@@ -84,23 +74,13 @@ async function ensureSchema() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_list_items_list_id ON list_items(list_id);`);
 }
 
-ensureSchema().catch((e) => {
-  console.error("Schema init failed:", e);
-});
+ensureSchema().catch((e) => console.error("Schema init failed:", e));
 
 // ---------- helpers ----------
 function json(res, status, obj) {
   res.status(status);
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   res.send(JSON.stringify(obj));
-}
-
-function normalizeCustomerId(raw) {
-  if (raw == null) return null;
-  const s = String(raw).trim();
-  if (!s) return null;
-  if (!/^\d+$/.test(s)) return null;
-  return s;
 }
 
 function safeParseItems(itemsStr) {
@@ -120,14 +100,62 @@ function safeParseItems(itemsStr) {
   }
 }
 
+function normalizeCustomerId(raw) {
+  if (raw == null) return null;
+  const s = String(raw).trim();
+  if (!s) return null;
+  if (!/^\d+$/.test(s)) return null;
+  return s;
+}
+
 function nowIso() {
   return Date.now().toString();
+}
+
+// ---------- Shopify Admin GraphQL ----------
+async function shopifyGql(query, variables = {}) {
+  if (!SHOPIFY_STORE_DOMAIN || !SHOPIFY_ADMIN_ACCESS_TOKEN) {
+    throw new Error("Missing SHOPIFY_STORE_DOMAIN or SHOPIFY_ADMIN_ACCESS_TOKEN");
+  }
+
+  const url = `https://${SHOPIFY_STORE_DOMAIN}/admin/api/2025-01/graphql.json`;
+
+  const r = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Shopify-Access-Token": SHOPIFY_ADMIN_ACCESS_TOKEN,
+      Accept: "application/json",
+    },
+    body: JSON.stringify({ query, variables }),
+  });
+
+  const text = await r.text();
+  let data = null;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    // If Shopify returns HTML or anything else, show a snippet
+    const snippet = (text || "").replace(/\s+/g, " ").slice(0, 220);
+    throw new Error(`Non-JSON from Shopify Admin API (${r.status}): ${snippet}`);
+  }
+
+  if (!r.ok) {
+    throw new Error(data?.errors?.[0]?.message || `Shopify Admin API HTTP ${r.status}`);
+  }
+
+  if (data?.errors && Array.isArray(data.errors) && data.errors.length) {
+    const msg = data.errors.map((e) => e.message).filter(Boolean).join(" | ");
+    throw new Error(msg || "Shopify GraphQL error");
+  }
+
+  return data.data;
 }
 
 // ---------- Shopify App Proxy signature verification ----------
 function verifyAppProxy(req, res, next) {
   try {
-    if (!SHOPIFY_APP_SECRET) return next(); // allow dev if missing
+    if (!SHOPIFY_APP_SECRET) return next();
 
     const q = { ...req.query };
     const provided = (q.signature || "").toString();
@@ -144,7 +172,6 @@ function verifyAppProxy(req, res, next) {
 
     const a = Buffer.from(digest, "utf8");
     const b = Buffer.from(provided, "utf8");
-
     if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
       return json(res, 401, { ok: false, error: "Invalid signature" });
     }
@@ -156,53 +183,10 @@ function verifyAppProxy(req, res, next) {
   }
 }
 
-// ---------- Shopify Admin GraphQL ----------
-async function shopifyGql(query, variables) {
-  if (!SHOPIFY_SHOP_DOMAIN) throw new Error("Missing SHOPIFY_SHOP_DOMAIN");
-  if (!SHOPIFY_ADMIN_ACCESS_TOKEN) throw new Error("Missing SHOPIFY_ADMIN_ACCESS_TOKEN");
-
-  const url = `https://${SHOPIFY_SHOP_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`;
-
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Shopify-Access-Token": SHOPIFY_ADMIN_ACCESS_TOKEN,
-      "Accept": "application/json",
-    },
-    body: JSON.stringify({ query, variables }),
-  });
-
-  const text = await resp.text();
-
-  let payload = null;
-  try {
-    payload = JSON.parse(text);
-  } catch {
-    // if Shopify ever returns HTML (rare), show snippet
-    const snippet = (text || "").replace(/\s+/g, " ").slice(0, 300);
-    throw new Error(`Non-JSON from Shopify Admin (${resp.status}): ${snippet}`);
-  }
-
-  if (!resp.ok) {
-    throw new Error(`Shopify Admin HTTP ${resp.status}: ${payload?.errors?.[0]?.message || "Request failed"}`);
-  }
-
-  // GraphQL "errors" top-level
-  if (payload?.errors) {
-    const msgs = Array.isArray(payload.errors)
-      ? payload.errors.map((e) => e.message).filter(Boolean).join(" | ")
-      : "GraphQL error";
-    throw new Error(msgs);
-  }
-
-  return payload.data;
-}
-
 // ---------- routes ----------
 app.get("/health", (req, res) => json(res, 200, { ok: true, ts: nowIso() }));
 
-// Some testers hit odd ping paths
+// Proxy ping helper
 app.get("/proxy-ping/proxy", (req, res) =>
   json(res, 200, {
     ok: true,
@@ -220,8 +204,11 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
     const method = req.method.toUpperCase();
 
     const customerId = normalizeCustomerId(req.query.customer_id || req.body?.customer_id);
-    if (!customerId) return json(res, 400, { ok: false, error: "Missing customer_id" });
+    if (!customerId) {
+      return json(res, 400, { ok: false, error: "Missing customer_id" });
+    }
 
+    // ✅ Allowed action/method combos
     const allowed = {
       list: ["GET"],
       get: ["GET"],
@@ -262,7 +249,6 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
           id: r.id,
           name: r.name,
           updated_at: r.updated_at_ms ? String(Math.trunc(r.updated_at_ms)) : null,
-          // keep lightweight; UI can fetch full list on View/Edit
           items: [],
           item_count: Number(r.item_count || 0),
         }));
@@ -284,9 +270,7 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
           [listId, customerId]
         );
 
-        if (!listRes.rows.length) {
-          return json(res, 404, { ok: false, error: "List not found" });
-        }
+        if (!listRes.rows.length) return json(res, 404, { ok: false, error: "List not found" });
 
         const itemsRes = await pool.query(
           `
@@ -298,19 +282,17 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
           [listId]
         );
 
-        const list = {
-          id: listRes.rows[0].id,
-          name: listRes.rows[0].name,
-          updated_at: listRes.rows[0].updated_at_ms
-            ? String(Math.trunc(listRes.rows[0].updated_at_ms))
-            : null,
-          items: itemsRes.rows.map((x) => ({
-            sku: x.sku,
-            quantity: Number(x.quantity || 1),
-          })),
-        };
-
-        return json(res, 200, { ok: true, list });
+        return json(res, 200, {
+          ok: true,
+          list: {
+            id: listRes.rows[0].id,
+            name: listRes.rows[0].name,
+            updated_at: listRes.rows[0].updated_at_ms
+              ? String(Math.trunc(listRes.rows[0].updated_at_ms))
+              : null,
+            items: itemsRes.rows.map((x) => ({ sku: x.sku, quantity: Number(x.quantity || 1) })),
+          },
+        });
       }
 
       case "upsert": {
@@ -412,15 +394,9 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
         if (!listId) return json(res, 400, { ok: false, error: "Missing list_id" });
 
         const listRes = await pool.query(
-          `
-          SELECT id
-          FROM lists
-          WHERE id = $1 AND customer_id = $2
-          LIMIT 1
-        `,
+          `SELECT id FROM lists WHERE id = $1 AND customer_id = $2 LIMIT 1`,
           [listId, customerId]
         );
-
         if (!listRes.rows.length) return json(res, 404, { ok: false, error: "List not found" });
 
         const itemsRes = await pool.query(
@@ -433,18 +409,15 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
           [listId]
         );
 
-        const items = itemsRes.rows.map((x) => ({
-          sku: x.sku,
-          quantity: Number(x.quantity || 1),
-        }));
-
-        return json(res, 200, { ok: true, items });
+        return json(res, 200, {
+          ok: true,
+          items: itemsRes.rows.map((x) => ({ sku: x.sku, quantity: Number(x.quantity || 1) })),
+        });
       }
 
       case "draftpad": {
-        // ✅ NO SKU parsing. We just store note as-is in the Draft Order note.
-        // ✅ Shopify requires at least 1 line item → we add a $0 customLineItem.
-
+        // ✅ No SKU parsing. Paste note as-is into Draft Order note.
+        // ✅ Shopify requires at least 1 line item → add a $0 line item.
         const note = (req.body?.note || "").toString().trim();
         if (!note) return json(res, 400, { ok: false, error: "Missing note" });
 
@@ -471,7 +444,7 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
 
         const input = {
           note: finalNote,
-          customLineItems: [
+          lineItems: [
             {
               title: "Order Pad Submission",
               quantity: 1,
@@ -488,7 +461,11 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
           if (userErrors.length) {
             return json(res, 200, {
               ok: false,
-              error: userErrors.map((e) => e.message).filter(Boolean).join(" | ") || "Draft order not created",
+              error:
+                userErrors
+                  .map((e) => e.message)
+                  .filter(Boolean)
+                  .join(" | ") || "Draft order not created",
             });
           }
 
@@ -516,11 +493,6 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
   }
 });
 
-// Fallback 404 (JSON)
-app.use((req, res) => {
-  json(res, 404, { ok: false, error: "Not found" });
-});
+app.use((req, res) => json(res, 404, { ok: false, error: "Not found" }));
 
-app.listen(PORT, () => {
-  console.log(`Server listening on ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
