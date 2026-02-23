@@ -1,17 +1,25 @@
 // server.js (ESM) — Express + Postgres + Shopify App Proxy verification
 // Supports actions: list, get, upsert, delete, orderify, draftpad
 //
-// App Proxy endpoint: /proxy
-// Your Shopify app proxy should point to: https://YOUR-RENDER-URL/proxy
+// IMPORTANT FIX:
+// - Shopify App Proxy can sometimes forward to /proxy/proxy depending on your proxy setup.
+// - This server handles BOTH "/proxy" AND "/proxy/*" so you don't get HTML (theme) 500s.
+//
+// URL patterns supported (storefront calls):
+//  - /apps/b2b-lists/proxy?action=list&customer_id=...
+//  - /apps/b2b-lists/proxy?action=get&customer_id=...&list_id=...
+//  - /apps/b2b-lists/proxy?action=upsert&customer_id=...   (POST urlencoded)
+//  - /apps/b2b-lists/proxy?action=delete&customer_id=...   (POST urlencoded)
+//  - /apps/b2b-lists/proxy?action=orderify&customer_id=...&list_id=...
+//  - /apps/b2b-lists/proxy?action=draftpad&customer_id=... (POST urlencoded)
 //
 // ENV required:
 //   DATABASE_URL
 //   SHOPIFY_APP_SECRET
-//   SHOPIFY_SHOP_DOMAIN
-//   SHOPIFY_ADMIN_ACCESS_TOKEN
+//   SHOPIFY_ADMIN_TOKEN         (Admin API access token - from your app install / admin token area)
+//   SHOPIFY_STORE_DOMAIN        (e.g. mississauga-hardware-wholesale.myshopify.com)
 //
 // Optional:
-//   SHOPIFY_API_VERSION (default 2024-10)
 //   PORT (default 3000)
 
 import express from "express";
@@ -23,20 +31,22 @@ const { Pool } = pg;
 const app = express();
 app.set("trust proxy", 1);
 
-// App Proxy is most reliable with urlencoded bodies
+// App Proxy + Shopify can be picky; urlencoded is safest
 app.use(express.urlencoded({ extended: false }));
 
 const PORT = process.env.PORT || 3000;
+
 const DATABASE_URL = process.env.DATABASE_URL;
 const SHOPIFY_APP_SECRET = process.env.SHOPIFY_APP_SECRET;
-const SHOPIFY_SHOP_DOMAIN = process.env.SHOPIFY_SHOP_DOMAIN;
-const SHOPIFY_ADMIN_ACCESS_TOKEN = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
-const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || "2024-10";
+
+// Draft order (Admin API)
+const SHOPIFY_ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;
+const SHOPIFY_STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN;
 
 if (!DATABASE_URL) console.warn("Missing env DATABASE_URL");
 if (!SHOPIFY_APP_SECRET) console.warn("Missing env SHOPIFY_APP_SECRET");
-if (!SHOPIFY_SHOP_DOMAIN) console.warn("Missing env SHOPIFY_SHOP_DOMAIN");
-if (!SHOPIFY_ADMIN_ACCESS_TOKEN) console.warn("Missing env SHOPIFY_ADMIN_ACCESS_TOKEN");
+if (!SHOPIFY_ADMIN_TOKEN) console.warn("Missing env SHOPIFY_ADMIN_TOKEN (draftpad will fail)");
+if (!SHOPIFY_STORE_DOMAIN) console.warn("Missing env SHOPIFY_STORE_DOMAIN (draftpad will fail)");
 
 const pool = new Pool({
   connectionString: DATABASE_URL,
@@ -47,8 +57,8 @@ const pool = new Pool({
 async function ensureSchema() {
   try {
     await pool.query(`CREATE EXTENSION IF NOT EXISTS pgcrypto;`);
-  } catch (e) {
-    // ignore if extensions are locked down
+  } catch {
+    // ok if extensions are locked down
   }
 
   await pool.query(`
@@ -76,7 +86,9 @@ async function ensureSchema() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_list_items_list_id ON list_items(list_id);`);
 }
 
-ensureSchema().catch((e) => console.error("Schema init failed:", e));
+ensureSchema().catch((e) => {
+  console.error("Schema init failed:", e);
+});
 
 // ---------- helpers ----------
 function json(res, status, obj) {
@@ -114,60 +126,7 @@ function nowIso() {
   return Date.now().toString();
 }
 
-// ---------- Shopify Admin GraphQL ----------
-async function shopifyGql(query, variables = {}) {
-  if (!SHOPIFY_SHOP_DOMAIN || !SHOPIFY_ADMIN_ACCESS_TOKEN) {
-    return { ok: false, error: "Missing Shopify Admin credentials (SHOPIFY_SHOP_DOMAIN / SHOPIFY_ADMIN_ACCESS_TOKEN)" };
-  }
-
-  const url = `https://${SHOPIFY_SHOP_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`;
-
-  try {
-    const r = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Shopify-Access-Token": SHOPIFY_ADMIN_ACCESS_TOKEN,
-        "Accept": "application/json",
-      },
-      body: JSON.stringify({ query, variables }),
-    });
-
-    const text = await r.text();
-    let raw = null;
-    try { raw = JSON.parse(text); } catch { /* not json */ }
-
-    if (!raw) {
-      return { ok: false, error: `Non-JSON response from Shopify Admin (${r.status})`, raw: text.slice(0, 1500) };
-    }
-
-    // GraphQL top-level errors
-    if (Array.isArray(raw.errors) && raw.errors.length) {
-      const msg = raw.errors.map(e => e?.message).filter(Boolean).join(" | ");
-      return { ok: false, error: msg || "GraphQL error", raw };
-    }
-
-    return { ok: true, raw };
-  } catch (e) {
-    return { ok: false, error: e?.message ? String(e.message) : "Shopify request failed" };
-  }
-}
-
-let CACHED_CURRENCY = null;
-async function getShopCurrencyCode() {
-  if (CACHED_CURRENCY) return CACHED_CURRENCY;
-
-  const q = `query { shop { currencyCode } }`;
-  const r = await shopifyGql(q, {});
-  if (r.ok) {
-    const code = r.raw?.data?.shop?.currencyCode;
-    if (code) CACHED_CURRENCY = code;
-  }
-  return CACHED_CURRENCY || "CAD";
-}
-
 // ---------- Shopify App Proxy signature verification ----------
-// HMAC-SHA256 of sorted query string (excluding signature), compared to signature.
 function verifyAppProxy(req, res, next) {
   try {
     if (!SHOPIFY_APP_SECRET) return next();
@@ -201,10 +160,50 @@ function verifyAppProxy(req, res, next) {
   }
 }
 
+// ---------- Shopify Admin GraphQL helper ----------
+async function shopifyGql(query, variables) {
+  if (!SHOPIFY_STORE_DOMAIN || !SHOPIFY_ADMIN_TOKEN) {
+    return { ok: false, error: "Missing SHOPIFY_STORE_DOMAIN or SHOPIFY_ADMIN_TOKEN" };
+  }
+
+  const url = `https://${SHOPIFY_STORE_DOMAIN}/admin/api/2025-01/graphql.json`;
+
+  const r = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN,
+    },
+    body: JSON.stringify({ query, variables }),
+  });
+
+  const text = await r.text();
+  let j = null;
+  try {
+    j = JSON.parse(text);
+  } catch {
+    return { ok: false, error: `Non-JSON Admin API response (${r.status}): ${text.slice(0, 220)}` };
+  }
+
+  if (!r.ok) {
+    return { ok: false, error: `Admin API HTTP ${r.status}`, raw: j };
+  }
+
+  if (j.errors && Array.isArray(j.errors) && j.errors.length) {
+    return { ok: false, error: "Admin API errors", raw: j.errors };
+  }
+
+  return { ok: true, data: j.data };
+}
+
 // ---------- routes ----------
 app.get("/health", (req, res) => json(res, 200, { ok: true, ts: nowIso() }));
+
+// Helpful for diagnosing "Cannot GET /proxy-ping/proxy"
 app.get("/proxy-ping/proxy", (req, res) => json(res, 200, { ok: true, pong: true, ts: nowIso() }));
 
+// Main App Proxy endpoint
+// ✅ FIX: handle both "/proxy" and "/proxy/*" (covers /proxy/proxy forwarding)
 app.all(["/proxy", "/proxy/*"], verifyAppProxy, async (req, res) => {
   try {
     const action = (req.query.action || req.query.actions || "").toString().trim();
@@ -228,11 +227,6 @@ app.all(["/proxy", "/proxy/*"], verifyAppProxy, async (req, res) => {
         error: `Unsupported action/method. action=${action || "(missing)"} method=${method}`,
       });
     }
-
-    // ... keep ALL your existing switch(action) code here unchanged ...
-  } catch (e) {
-    console.error("Proxy handler error:", e);
-    return json(res, 500, { ok: false, error: "Server error" });
 
     switch (action) {
       case "list": {
@@ -258,7 +252,7 @@ app.all(["/proxy", "/proxy/*"], verifyAppProxy, async (req, res) => {
           id: r.id,
           name: r.name,
           updated_at: r.updated_at_ms ? String(Math.trunc(r.updated_at_ms)) : null,
-          items: [],
+          items: [], // lightweight; fetch items via get
           item_count: Number(r.item_count || 0),
         }));
 
@@ -294,8 +288,13 @@ app.all(["/proxy", "/proxy/*"], verifyAppProxy, async (req, res) => {
         const list = {
           id: listRes.rows[0].id,
           name: listRes.rows[0].name,
-          updated_at: listRes.rows[0].updated_at_ms ? String(Math.trunc(listRes.rows[0].updated_at_ms)) : null,
-          items: itemsRes.rows.map((x) => ({ sku: x.sku, quantity: Number(x.quantity || 1) })),
+          updated_at: listRes.rows[0].updated_at_ms
+            ? String(Math.trunc(listRes.rows[0].updated_at_ms))
+            : null,
+          items: itemsRes.rows.map((x) => ({
+            sku: x.sku,
+            quantity: Number(x.quantity || 1),
+          })),
         };
 
         return json(res, 200, { ok: true, list });
@@ -392,7 +391,6 @@ app.all(["/proxy", "/proxy/*"], verifyAppProxy, async (req, res) => {
         );
 
         if (!del.rows.length) return json(res, 404, { ok: false, error: "List not found" });
-
         return json(res, 200, { ok: true });
       }
 
@@ -421,108 +419,106 @@ app.all(["/proxy", "/proxy/*"], verifyAppProxy, async (req, res) => {
           [listId]
         );
 
-        const items = itemsRes.rows.map((x) => ({ sku: x.sku, quantity: Number(x.quantity || 1) }));
+        const items = itemsRes.rows.map((x) => ({
+          sku: x.sku,
+          quantity: Number(x.quantity || 1),
+        }));
+
         return json(res, 200, { ok: true, items });
       }
 
       case "draftpad": {
+        // Note comes from the Order Pad textarea
         const note = (req.body?.note || "").toString().trim();
         if (!note) return json(res, 400, { ok: false, error: "Missing note" });
 
+        // Optional context from Liquid (no payment terms needed)
         const companyName = (req.body?.company_name || "").toString().trim();
         const locationName = (req.body?.location_name || "").toString().trim();
-        const customerEmail = (req.body?.customer_email || "").toString().trim();
+        const shippingJson = (req.body?.shipping_address_json || "").toString().trim();
+        const repEmail = (req.body?.rep_email || "").toString().trim();
 
+        // Build draft note
         let header = "Order Pad Submission";
         header += `\nCustomer ID: ${customerId}`;
         if (companyName) header += `\nCompany: ${companyName}`;
         if (locationName) header += `\nLocation: ${locationName}`;
-        if (customerEmail) header += `\nEmail: ${customerEmail}`;
+        if (repEmail) header += `\nSales Rep: ${repEmail}`;
 
         const finalNote = header + "\n\n" + note;
 
-        // Optional: shipping address (only applied if it has address1/city/country)
-        const shippingAddress = (() => {
-          const firstName = (req.body?.ship_first_name || "").toString().trim();
-          const lastName = (req.body?.ship_last_name || "").toString().trim();
-          const address1 = (req.body?.ship_address1 || "").toString().trim();
-          const city = (req.body?.ship_city || "").toString().trim();
-          const province = (req.body?.ship_province || "").toString().trim();
-          const zip = (req.body?.ship_zip || "").toString().trim();
-          const country = (req.body?.ship_country || "").toString().trim();
-          if (!address1 || !city || !country) return null;
-
-          return {
-            firstName: firstName || undefined,
-            lastName: lastName || undefined,
-            address1,
-            address2: (req.body?.ship_address2 || "").toString().trim() || undefined,
-            city,
-            province: province || undefined,
-            zip: zip || undefined,
-            country,
-            phone: (req.body?.ship_phone || "").toString().trim() || undefined,
-          };
-        })();
-
-        // ✅ Shopify requires at least one line item on Draft Orders.
-        // We add a $0 custom item so the draft can be created even if it's note-only.
-        const currencyCode = await getShopCurrencyCode();
+        // Parse shipping address JSON (optional)
+        let shippingAddress = null;
+        if (shippingJson) {
+          try {
+            const addr = JSON.parse(shippingJson);
+            // Only include safe fields Shopify accepts
+            shippingAddress = {
+              firstName: addr.firstName || undefined,
+              lastName: addr.lastName || undefined,
+              address1: addr.address1 || undefined,
+              address2: addr.address2 || undefined,
+              city: addr.city || undefined,
+              province: addr.province || undefined,
+              zip: addr.zip || undefined,
+              country: addr.country || undefined,
+              phone: addr.phone || undefined,
+              company: addr.company || undefined,
+            };
+          } catch {
+            shippingAddress = null;
+          }
+        }
 
         const mutation = `
           mutation DraftOrderCreate($input: DraftOrderInput!) {
             draftOrderCreate(input: $input) {
-              draftOrder { id name }
+              draftOrder { id name invoiceUrl }
               userErrors { field message }
             }
           }
         `;
 
+        // Customer GID
+        const customerGid = `gid://shopify/Customer/${customerId}`;
+
         const input = {
+          customerId: customerGid,
           note: finalNote,
-          lineItems: [
-            {
-              title: "Order Pad Submission",
-              quantity: 1,
-              originalUnitPrice: { amount: "0.00", currencyCode },
-              taxable: false,
-              requiresShipping: false,
-            },
-          ],
-          ...(customerEmail ? { email: customerEmail } : {}),
-          ...(shippingAddress ? { shippingAddress } : {}),
+          // No lineItems on purpose: order pad is a note-based request (team reviews/edits)
+          // You CAN add a dummy line item if your shop requires it, but you told me you want note-only.
         };
+
+        if (shippingAddress) {
+          input.shippingAddress = shippingAddress;
+        }
 
         const gql = await shopifyGql(mutation, { input });
 
         if (!gql.ok) {
-          return json(res, 500, {
-            ok: false,
-            error: gql.error || "Draft order not created",
-            detail: typeof gql.raw === "string" ? gql.raw : JSON.stringify(gql.raw || {}).slice(0, 900),
-          });
+          console.error("draftpad Admin API error:", gql.error, gql.raw || "");
+          return json(res, 500, { ok: false, error: "Draft order not created" });
         }
 
-        const out = gql.raw?.data?.draftOrderCreate;
-        const userErrors = Array.isArray(out?.userErrors) ? out.userErrors : [];
-        if (userErrors.length) {
-          const msg = userErrors
-            .map((e) => {
-              const field = Array.isArray(e.field) ? e.field.join(".") : "";
-              return (field ? `${field}: ` : "") + (e.message || "");
-            })
-            .filter(Boolean)
-            .join(" | ");
-
-          return json(res, 200, { ok: false, error: msg || "Draft order not created", userErrors });
+        const payload = gql.data?.draftOrderCreate;
+        const errs = payload?.userErrors || [];
+        if (errs.length) {
+          console.error("draftpad userErrors:", errs);
+          return json(res, 400, { ok: false, error: errs[0]?.message || "Draft order not created" });
         }
 
-        const draft = out?.draftOrder;
+        const draft = payload?.draftOrder;
         if (!draft?.id) {
-          return json(res, 200, { ok: false, error: "Draft order not created" });
+          console.error("draftpad missing draftOrder in response:", payload);
+          return json(res, 500, { ok: false, error: "Draft order not created" });
         }
 
-        return json(res, 200, { ok: true, draft: { id: draft.id, name: draft.name } });
+        return json(res, 200, {
+          ok: true,
+          draft_id: draft.id,
+          draft_name: draft.name,
+          invoice_url: draft.invoiceUrl || null,
+        });
       }
 
       default:
@@ -534,6 +530,11 @@ app.all(["/proxy", "/proxy/*"], verifyAppProxy, async (req, res) => {
   }
 });
 
-app.use((req, res) => json(res, 404, { ok: false, error: "Not found" }));
+// Fallback 404 (still JSON)
+app.use((req, res) => {
+  json(res, 404, { ok: false, error: "Not found" });
+});
 
-app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Server listening on ${PORT}`);
+});
