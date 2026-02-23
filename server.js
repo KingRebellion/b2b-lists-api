@@ -233,8 +233,7 @@ app.all(["/proxy", "/proxy/*"], verifyAppProxy, async (req, res) => {
   } catch (e) {
     console.error("Proxy handler error:", e);
     return json(res, 500, { ok: false, error: "Server error" });
-  }
-});
+
     switch (action) {
       case "list": {
         const listsRes = await pool.query(
