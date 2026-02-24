@@ -191,6 +191,7 @@ function verifyAppProxy(req, res, next) {
 // ---------- routes ----------
 app.get("/health", (req, res) => json(res, 200, { ok: true, ts: nowIso() }));
 
+// Proxy ping helper
 app.get("/proxy-ping/proxy", (req, res) =>
   json(res, 200, {
     ok: true,
@@ -212,6 +213,7 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
       return json(res, 400, { ok: false, error: "Missing customer_id" });
     }
 
+    // ✅ Allowed action/method combos
     const allowed = {
       list: ["GET"],
       get: ["GET"],
@@ -446,7 +448,7 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
         if (companyName) header += `\nCompany: ${companyName}`;
         if (locationName) header += `\nLocation: ${locationName}`;
 
-        // Optional: add cart summary to note for staff clarity
+        // Optional: cart summary in note
         if (cartItems.length) {
           header += `\n\nCart Items:`;
           for (const it of cartItems) {
@@ -459,7 +461,7 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
 
         const finalNote = header + (note ? "\n\n---\n" + note : "");
 
-        // Build lineItems from cart variants
+        // Build Draft line items from cart variants
         const lineItemsFromCart = cartItems
           .map((it) => {
             const variantIdNum = Number(it?.variant_id || 0);
