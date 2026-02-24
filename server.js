@@ -7,11 +7,8 @@
 // ENV required:
 //   DATABASE_URL
 //   SHOPIFY_APP_SECRET
-//   SHOPIFY_STORE_DOMAIN          (e.g. mississauga-hardware-wholesale.myshopify.com)
-//   SHOPIFY_ADMIN_ACCESS_TOKEN    (Admin API access token w/ required scopes)
-//
-// Required Admin scopes for file upload:
-//   write_files (recommended also read_files)
+//   SHOPIFY_STORE_DOMAIN
+//   SHOPIFY_ADMIN_ACCESS_TOKEN  (Admin API token w/ write_files for uploads)
 
 import express from "express";
 import crypto from "crypto";
@@ -26,7 +23,6 @@ app.set("trust proxy", 1);
 // App Proxy: keep urlencoded enabled
 app.use(express.urlencoded({ extended: false }));
 
-// Multer for Shopify Files upload (multipart/form-data)
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 15 * 1024 * 1024 }, // 15MB
@@ -38,11 +34,6 @@ const SHOPIFY_APP_SECRET = process.env.SHOPIFY_APP_SECRET;
 const SHOPIFY_STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN;
 const SHOPIFY_ADMIN_ACCESS_TOKEN = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
 
-if (!DATABASE_URL) console.warn("Missing env DATABASE_URL");
-if (!SHOPIFY_APP_SECRET) console.warn("Missing env SHOPIFY_APP_SECRET");
-if (!SHOPIFY_STORE_DOMAIN) console.warn("Missing env SHOPIFY_STORE_DOMAIN");
-if (!SHOPIFY_ADMIN_ACCESS_TOKEN) console.warn("Missing env SHOPIFY_ADMIN_ACCESS_TOKEN");
-
 const pool = new Pool({
   connectionString: DATABASE_URL,
   ssl: process.env.NODE_ENV === "production" ? { rejectUnauthorized: false } : false,
@@ -52,9 +43,7 @@ const pool = new Pool({
 async function ensureSchema() {
   try {
     await pool.query(`CREATE EXTENSION IF NOT EXISTS pgcrypto;`);
-  } catch {
-    // ignore
-  }
+  } catch {}
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS lists (
@@ -142,7 +131,7 @@ async function shopifyGql(query, variables = {}) {
   });
 
   const text = await r.text();
-  let data = null;
+  let data;
   try {
     data = JSON.parse(text);
   } catch {
@@ -151,9 +140,7 @@ async function shopifyGql(query, variables = {}) {
   }
 
   if (!r.ok) throw new Error(data?.errors?.[0]?.message || `Shopify Admin API HTTP ${r.status}`);
-
-  // Treat top-level "errors" as hard errors (scopes, etc.)
-  if (data?.errors?.length) {
+  if (Array.isArray(data?.errors) && data.errors.length) {
     const msg = data.errors.map((e) => e.message).filter(Boolean).join(" | ");
     throw new Error(msg || "Shopify GraphQL error");
   }
@@ -163,7 +150,6 @@ async function shopifyGql(query, variables = {}) {
 
 // ---------- Shopify Files upload (stagedUploadsCreate -> upload -> fileCreate) ----------
 async function uploadToShopifyFiles({ filename, mimeType, buffer }) {
-  // 1) stagedUploadsCreate
   const stagedMutation = `
     mutation stagedUploadsCreate($input: [StagedUploadInput!]!) {
       stagedUploadsCreate(input: $input) {
@@ -196,7 +182,6 @@ async function uploadToShopifyFiles({ filename, mimeType, buffer }) {
     throw new Error("Missing staged upload target");
   }
 
-  // 2) POST bytes to staged URL
   const form = new FormData();
   for (const p of target.parameters) form.append(p.name, p.value);
   form.append("file", new Blob([buffer], { type: mimeType }), filename);
@@ -207,7 +192,6 @@ async function uploadToShopifyFiles({ filename, mimeType, buffer }) {
     throw new Error(`Staged upload failed (${up.status}): ${(txt || "").slice(0, 200)}`);
   }
 
-  // 3) fileCreate
   const fileCreateMutation = `
     mutation fileCreate($files: [FileCreateInput!]!) {
       fileCreate(files: $files) {
@@ -286,8 +270,6 @@ app.get("/proxy-ping/proxy", (req, res) =>
   })
 );
 
-// Main App Proxy endpoint
-// NOTE: upload.single("file") enables multipart for upload_po; safe for urlencoded too.
 app.all("/proxy", verifyAppProxy, upload.single("file"), async (req, res) => {
   try {
     const action = (req.query.action || req.query.actions || "").toString().trim();
@@ -475,7 +457,6 @@ app.all("/proxy", verifyAppProxy, upload.single("file"), async (req, res) => {
       }
 
       case "upload_po": {
-        // Expects multipart/form-data with file in req.file
         const f = req.file;
         if (!f || !f.buffer) return json(res, 400, { ok: false, error: "Missing file" });
 
@@ -492,14 +473,12 @@ app.all("/proxy", verifyAppProxy, upload.single("file"), async (req, res) => {
       }
 
       case "draftpad": {
-        // NOTE optional; cart-only is allowed
         const note = (req.body?.note || "").toString().trim();
 
         const companyName = (req.body?.company_name || "").toString().trim();
         const locationName = (req.body?.location_name || "").toString().trim();
         const customerEmail = (req.body?.customer_email || "").toString().trim();
 
-        // Required fields (validate server-side too)
         const poNumber = (req.body?.po_number || "").toString().trim();
         const siteContactName = (req.body?.site_contact_name || "").toString().trim();
         const siteContactPhone = (req.body?.site_contact_phone || "").toString().trim();
@@ -509,7 +488,6 @@ app.all("/proxy", verifyAppProxy, upload.single("file"), async (req, res) => {
         if (!siteContactName) return json(res, 400, { ok: false, error: "Missing Site Contact Name" });
         if (!siteContactPhone) return json(res, 400, { ok: false, error: "Missing Site Contact Phone" });
 
-        // cart_items is JSON string from /cart.js items
         const cartItemsRaw = (req.body?.cart_items || "").toString();
         let cartItems = [];
         try {
@@ -546,7 +524,6 @@ app.all("/proxy", verifyAppProxy, upload.single("file"), async (req, res) => {
 
         const finalNote = header + (note ? "\n\n---\n" + note : "");
 
-        // Build Draft line items from cart variants
         const lineItemsFromCart = cartItems
           .map((it) => {
             const variantIdNum = Number(it?.variant_id || 0);
@@ -571,13 +548,7 @@ app.all("/proxy", verifyAppProxy, upload.single("file"), async (req, res) => {
           note: finalNote,
           lineItems: lineItemsFromCart.length
             ? lineItemsFromCart
-            : [
-                {
-                  title: "Order Pad Submission",
-                  quantity: 1,
-                  originalUnitPrice: "0.00",
-                },
-              ],
+            : [{ title: "Order Pad Submission", quantity: 1, originalUnitPrice: "0.00" }],
         };
 
         try {
@@ -588,9 +559,7 @@ app.all("/proxy", verifyAppProxy, upload.single("file"), async (req, res) => {
           if (userErrors.length) {
             return json(res, 200, {
               ok: false,
-              error:
-                userErrors.map((e) => e.message).filter(Boolean).join(" | ") ||
-                "Draft order not created",
+              error: userErrors.map((e) => e.message).filter(Boolean).join(" | ") || "Draft order not created",
             });
           }
 
@@ -600,7 +569,6 @@ app.all("/proxy", verifyAppProxy, upload.single("file"), async (req, res) => {
             ok: true,
             draft_order_id: out.draftOrder.id,
             draft_order_name: out.draftOrder.name,
-            draft_order_email: out.draftOrder.email || null,
           });
         } catch (e) {
           console.error("draftpad failed:", e);
