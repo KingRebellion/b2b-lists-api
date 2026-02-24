@@ -1,29 +1,36 @@
 // server.js (ESM) — Express + Postgres + Shopify App Proxy verification
-// Supports actions: list, get, upsert, delete, orderify, draftpad
+// Supports actions: list, get, upsert, delete, orderify, draftpad, upload_po
 //
 // App Proxy endpoint: /proxy
-// Your Shopify proxy URL should be: https://YOUR-STORE.myshopify.com/apps/b2b-lists/proxy
+// Shopify proxy URL: https://YOUR-STORE.myshopify.com/apps/b2b-lists/proxy
 //
 // ENV required:
 //   DATABASE_URL
 //   SHOPIFY_APP_SECRET
 //   SHOPIFY_STORE_DOMAIN          (e.g. mississauga-hardware-wholesale.myshopify.com)
-//   SHOPIFY_ADMIN_ACCESS_TOKEN    (Admin API access token)
+//   SHOPIFY_ADMIN_ACCESS_TOKEN    (Admin API access token w/ required scopes)
 //
-// Optional:
-//   PORT (default 3000)
+// Required Admin scopes for file upload:
+//   write_files (recommended also read_files)
 
 import express from "express";
 import crypto from "crypto";
 import pg from "pg";
+import multer from "multer";
 
 const { Pool } = pg;
 
 const app = express();
 app.set("trust proxy", 1);
 
-// IMPORTANT: App Proxy often breaks with JSON bodies; keep urlencoded enabled.
+// App Proxy: keep urlencoded enabled
 app.use(express.urlencoded({ extended: false }));
+
+// Multer for Shopify Files upload (multipart/form-data)
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 15 * 1024 * 1024 }, // 15MB
+});
 
 const PORT = process.env.PORT || 3000;
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -45,8 +52,8 @@ const pool = new Pool({
 async function ensureSchema() {
   try {
     await pool.query(`CREATE EXTENSION IF NOT EXISTS pgcrypto;`);
-  } catch (e) {
-    // ignore if locked down
+  } catch {
+    // ignore
   }
 
   await pool.query(`
@@ -73,7 +80,6 @@ async function ensureSchema() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_lists_customer_id ON lists(customer_id);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_list_items_list_id ON list_items(list_id);`);
 }
-
 ensureSchema().catch((e) => console.error("Schema init failed:", e));
 
 // ---------- helpers ----------
@@ -108,7 +114,6 @@ function normalizeCustomerId(raw) {
   return s;
 }
 
-// Convert numeric Customer ID -> GID
 function customerGidFromNumericId(customerIdNumeric) {
   if (!customerIdNumeric) return null;
   return `gid://shopify/Customer/${customerIdNumeric}`;
@@ -145,18 +150,96 @@ async function shopifyGql(query, variables = {}) {
     throw new Error(`Non-JSON from Shopify Admin API (${r.status}): ${snippet}`);
   }
 
-  if (!r.ok) {
-    throw new Error(data?.errors?.[0]?.message || `Shopify Admin API HTTP ${r.status}`);
-  }
+  if (!r.ok) throw new Error(data?.errors?.[0]?.message || `Shopify Admin API HTTP ${r.status}`);
 
-  // IMPORTANT: If Shopify returns top-level "errors" because of missing scopes,
-  // treat it as a hard error (we will avoid requesting restricted fields in mutations).
-  if (data?.errors && Array.isArray(data.errors) && data.errors.length) {
+  // Treat top-level "errors" as hard errors (scopes, etc.)
+  if (data?.errors?.length) {
     const msg = data.errors.map((e) => e.message).filter(Boolean).join(" | ");
     throw new Error(msg || "Shopify GraphQL error");
   }
 
   return data.data;
+}
+
+// ---------- Shopify Files upload (stagedUploadsCreate -> upload -> fileCreate) ----------
+async function uploadToShopifyFiles({ filename, mimeType, buffer }) {
+  // 1) stagedUploadsCreate
+  const stagedMutation = `
+    mutation stagedUploadsCreate($input: [StagedUploadInput!]!) {
+      stagedUploadsCreate(input: $input) {
+        stagedTargets {
+          url
+          resourceUrl
+          parameters { name value }
+        }
+        userErrors { field message }
+      }
+    }
+  `;
+
+  const stagedInput = [
+    {
+      resource: "FILE",
+      filename,
+      mimeType,
+      httpMethod: "POST",
+    },
+  ];
+
+  const staged = await shopifyGql(stagedMutation, { input: stagedInput });
+  const out = staged?.stagedUploadsCreate;
+  const errs = out?.userErrors || [];
+  if (errs.length) throw new Error(errs.map((e) => e.message).filter(Boolean).join(" | ") || "stagedUploadsCreate failed");
+
+  const target = out?.stagedTargets?.[0];
+  if (!target?.url || !target?.resourceUrl || !Array.isArray(target.parameters)) {
+    throw new Error("Missing staged upload target");
+  }
+
+  // 2) POST bytes to staged URL
+  const form = new FormData();
+  for (const p of target.parameters) form.append(p.name, p.value);
+  form.append("file", new Blob([buffer], { type: mimeType }), filename);
+
+  const up = await fetch(target.url, { method: "POST", body: form });
+  if (!up.ok) {
+    const txt = await up.text().catch(() => "");
+    throw new Error(`Staged upload failed (${up.status}): ${(txt || "").slice(0, 200)}`);
+  }
+
+  // 3) fileCreate
+  const fileCreateMutation = `
+    mutation fileCreate($files: [FileCreateInput!]!) {
+      fileCreate(files: $files) {
+        files {
+          __typename
+          ... on GenericFile { id url }
+          ... on MediaImage { id image { url } }
+        }
+        userErrors { field message }
+      }
+    }
+  `;
+
+  const created = await shopifyGql(fileCreateMutation, {
+    files: [
+      {
+        originalSource: target.resourceUrl,
+        contentType: "FILE",
+        alt: filename,
+      },
+    ],
+  });
+
+  const fc = created?.fileCreate;
+  const fcErrs = fc?.userErrors || [];
+  if (fcErrs.length) throw new Error(fcErrs.map((e) => e.message).filter(Boolean).join(" | ") || "fileCreate failed");
+
+  const f = fc?.files?.[0];
+  const url = f?.url || f?.image?.url || null;
+  if (!url) throw new Error("File created but URL not returned yet");
+
+  return { url };
 }
 
 // ---------- Shopify App Proxy signature verification ----------
@@ -193,7 +276,6 @@ function verifyAppProxy(req, res, next) {
 // ---------- routes ----------
 app.get("/health", (req, res) => json(res, 200, { ok: true, ts: nowIso() }));
 
-// Proxy ping helper
 app.get("/proxy-ping/proxy", (req, res) =>
   json(res, 200, {
     ok: true,
@@ -205,17 +287,15 @@ app.get("/proxy-ping/proxy", (req, res) =>
 );
 
 // Main App Proxy endpoint
-app.all("/proxy", verifyAppProxy, async (req, res) => {
+// NOTE: upload.single("file") enables multipart for upload_po; safe for urlencoded too.
+app.all("/proxy", verifyAppProxy, upload.single("file"), async (req, res) => {
   try {
     const action = (req.query.action || req.query.actions || "").toString().trim();
     const method = req.method.toUpperCase();
 
     const customerId = normalizeCustomerId(req.query.customer_id || req.body?.customer_id);
-    if (!customerId) {
-      return json(res, 400, { ok: false, error: "Missing customer_id" });
-    }
+    if (!customerId) return json(res, 400, { ok: false, error: "Missing customer_id" });
 
-    // ✅ Allowed action/method combos
     const allowed = {
       list: ["GET"],
       get: ["GET"],
@@ -223,6 +303,7 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
       upsert: ["POST"],
       delete: ["POST"],
       draftpad: ["POST"],
+      upload_po: ["POST"],
     };
 
     if (!action || !allowed[action] || !allowed[action].includes(method)) {
@@ -240,11 +321,7 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
             l.id,
             l.name,
             EXTRACT(EPOCH FROM l.updated_at) * 1000 AS updated_at_ms,
-            (
-              SELECT COUNT(*)
-              FROM list_items li
-              WHERE li.list_id = l.id
-            ) AS item_count
+            (SELECT COUNT(*) FROM list_items li WHERE li.list_id = l.id) AS item_count
           FROM lists l
           WHERE l.customer_id = $1
           ORDER BY l.updated_at DESC
@@ -294,9 +371,7 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
           list: {
             id: listRes.rows[0].id,
             name: listRes.rows[0].name,
-            updated_at: listRes.rows[0].updated_at_ms
-              ? String(Math.trunc(listRes.rows[0].updated_at_ms))
-              : null,
+            updated_at: listRes.rows[0].updated_at_ms ? String(Math.trunc(listRes.rows[0].updated_at_ms)) : null,
             items: itemsRes.rows.map((x) => ({ sku: x.sku, quantity: Number(x.quantity || 1) })),
           },
         });
@@ -329,22 +404,14 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
 
             if (!up.rows.length) {
               const ins = await client.query(
-                `
-                INSERT INTO lists (customer_id, name)
-                VALUES ($1, $2)
-                RETURNING id
-              `,
+                `INSERT INTO lists (customer_id, name) VALUES ($1, $2) RETURNING id`,
                 [customerId, name]
               );
               listId = ins.rows[0].id;
             }
           } else {
             const ins = await client.query(
-              `
-              INSERT INTO lists (customer_id, name)
-              VALUES ($1, $2)
-              RETURNING id
-            `,
+              `INSERT INTO lists (customer_id, name) VALUES ($1, $2) RETURNING id`,
               [customerId, name]
             );
             listId = ins.rows[0].id;
@@ -360,13 +427,7 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
             params.push(listId, it.sku, it.quantity);
           }
 
-          await client.query(
-            `
-            INSERT INTO list_items (list_id, sku, quantity)
-            VALUES ${values.join(",")}
-          `,
-            params
-          );
+          await client.query(`INSERT INTO list_items (list_id, sku, quantity) VALUES ${values.join(",")}`, params);
 
           await client.query("COMMIT");
           return json(res, 200, { ok: true, list_id: listId });
@@ -384,11 +445,7 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
         if (!listId) return json(res, 400, { ok: false, error: "Missing list_id" });
 
         const del = await pool.query(
-          `
-          DELETE FROM lists
-          WHERE id = $1 AND customer_id = $2
-          RETURNING id
-        `,
+          `DELETE FROM lists WHERE id = $1 AND customer_id = $2 RETURNING id`,
           [listId, customerId]
         );
 
@@ -407,12 +464,7 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
         if (!listRes.rows.length) return json(res, 404, { ok: false, error: "List not found" });
 
         const itemsRes = await pool.query(
-          `
-          SELECT sku, quantity
-          FROM list_items
-          WHERE list_id = $1
-          ORDER BY created_at ASC
-        `,
+          `SELECT sku, quantity FROM list_items WHERE list_id = $1 ORDER BY created_at ASC`,
           [listId]
         );
 
@@ -422,13 +474,40 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
         });
       }
 
+      case "upload_po": {
+        // Expects multipart/form-data with file in req.file
+        const f = req.file;
+        if (!f || !f.buffer) return json(res, 400, { ok: false, error: "Missing file" });
+
+        const filename = (f.originalname || "po-upload").toString();
+        const mimeType = (f.mimetype || "application/octet-stream").toString();
+
+        try {
+          const uploaded = await uploadToShopifyFiles({ filename, mimeType, buffer: f.buffer });
+          return json(res, 200, { ok: true, url: uploaded.url });
+        } catch (e) {
+          console.error("upload_po failed:", e);
+          return json(res, 200, { ok: false, error: e.message || "Upload failed" });
+        }
+      }
+
       case "draftpad": {
-        // NOTE optional now (cart-only is allowed)
+        // NOTE optional; cart-only is allowed
         const note = (req.body?.note || "").toString().trim();
 
         const companyName = (req.body?.company_name || "").toString().trim();
         const locationName = (req.body?.location_name || "").toString().trim();
         const customerEmail = (req.body?.customer_email || "").toString().trim();
+
+        // Required fields (validate server-side too)
+        const poNumber = (req.body?.po_number || "").toString().trim();
+        const siteContactName = (req.body?.site_contact_name || "").toString().trim();
+        const siteContactPhone = (req.body?.site_contact_phone || "").toString().trim();
+        const poFileUrl = (req.body?.po_file_url || "").toString().trim();
+
+        if (!poNumber) return json(res, 400, { ok: false, error: "Missing PO Number" });
+        if (!siteContactName) return json(res, 400, { ok: false, error: "Missing Site Contact Name" });
+        if (!siteContactPhone) return json(res, 400, { ok: false, error: "Missing Site Contact Phone" });
 
         // cart_items is JSON string from /cart.js items
         const cartItemsRaw = (req.body?.cart_items || "").toString();
@@ -450,7 +529,11 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
         if (companyName) header += `\nCompany: ${companyName}`;
         if (locationName) header += `\nLocation: ${locationName}`;
 
-        // Optional: cart summary in note
+        header += `\n\nPO Number: ${poNumber}`;
+        header += `\nSite Contact: ${siteContactName}`;
+        header += `\nSite Contact Phone: ${siteContactPhone}`;
+        if (poFileUrl) header += `\nPO File: ${poFileUrl}`;
+
         if (cartItems.length) {
           header += `\n\nCart Items:`;
           for (const it of cartItems) {
@@ -473,7 +556,6 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
           })
           .filter(Boolean);
 
-        // ✅ MUTATION UPDATED: removed customer { ... } to avoid read_customers scope requirement
         const mutation = `
           mutation DraftOrderCreate($input: DraftOrderInput!) {
             draftOrderCreate(input: $input) {
@@ -487,7 +569,6 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
           customerId: customerGidFromNumericId(customerId),
           ...(customerEmail ? { email: customerEmail } : {}),
           note: finalNote,
-
           lineItems: lineItemsFromCart.length
             ? lineItemsFromCart
             : [
@@ -508,16 +589,12 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
             return json(res, 200, {
               ok: false,
               error:
-                userErrors
-                  .map((e) => e.message)
-                  .filter(Boolean)
-                  .join(" | ") || "Draft order not created",
+                userErrors.map((e) => e.message).filter(Boolean).join(" | ") ||
+                "Draft order not created",
             });
           }
 
-          if (!out?.draftOrder?.id) {
-            return json(res, 200, { ok: false, error: "Draft order not created" });
-          }
+          if (!out?.draftOrder?.id) return json(res, 200, { ok: false, error: "Draft order not created" });
 
           return json(res, 200, {
             ok: true,
