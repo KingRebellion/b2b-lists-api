@@ -149,6 +149,8 @@ async function shopifyGql(query, variables = {}) {
     throw new Error(data?.errors?.[0]?.message || `Shopify Admin API HTTP ${r.status}`);
   }
 
+  // IMPORTANT: If Shopify returns top-level "errors" because of missing scopes,
+  // treat it as a hard error (we will avoid requesting restricted fields in mutations).
   if (data?.errors && Array.isArray(data.errors) && data.errors.length) {
     const msg = data.errors.map((e) => e.message).filter(Boolean).join(" | ");
     throw new Error(msg || "Shopify GraphQL error");
@@ -471,10 +473,11 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
           })
           .filter(Boolean);
 
+        // ✅ MUTATION UPDATED: removed customer { ... } to avoid read_customers scope requirement
         const mutation = `
           mutation DraftOrderCreate($input: DraftOrderInput!) {
             draftOrderCreate(input: $input) {
-              draftOrder { id name email customer { id email } }
+              draftOrder { id name email }
               userErrors { field message }
             }
           }
@@ -521,7 +524,6 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
             draft_order_id: out.draftOrder.id,
             draft_order_name: out.draftOrder.name,
             draft_order_email: out.draftOrder.email || null,
-            draft_order_customer_email: out.draftOrder.customer?.email || null,
           });
         } catch (e) {
           console.error("draftpad failed:", e);
