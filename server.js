@@ -108,7 +108,7 @@ function normalizeCustomerId(raw) {
   return s;
 }
 
-// ✅ FIX: helper to convert numeric customer id -> GraphQL GID
+// Convert numeric Customer ID -> GID
 function customerGidFromNumericId(customerIdNumeric) {
   if (!customerIdNumeric) return null;
   return `gid://shopify/Customer/${customerIdNumeric}`;
@@ -141,7 +141,6 @@ async function shopifyGql(query, variables = {}) {
   try {
     data = JSON.parse(text);
   } catch {
-    // If Shopify returns HTML or anything else, show a snippet
     const snippet = (text || "").replace(/\s+/g, " ").slice(0, 220);
     throw new Error(`Non-JSON from Shopify Admin API (${r.status}): ${snippet}`);
   }
@@ -192,7 +191,6 @@ function verifyAppProxy(req, res, next) {
 // ---------- routes ----------
 app.get("/health", (req, res) => json(res, 200, { ok: true, ts: nowIso() }));
 
-// Proxy ping helper
 app.get("/proxy-ping/proxy", (req, res) =>
   json(res, 200, {
     ok: true,
@@ -214,7 +212,6 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
       return json(res, 400, { ok: false, error: "Missing customer_id" });
     }
 
-    // ✅ Allowed action/method combos
     const allowed = {
       list: ["GET"],
       get: ["GET"],
@@ -422,14 +419,26 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
       }
 
       case "draftpad": {
-        // ✅ No SKU parsing. Paste note as-is into Draft Order note.
-        // ✅ Shopify requires at least 1 line item → add a $0 line item.
+        // NOTE optional now (cart-only is allowed)
         const note = (req.body?.note || "").toString().trim();
-        if (!note) return json(res, 400, { ok: false, error: "Missing note" });
 
         const companyName = (req.body?.company_name || "").toString().trim();
         const locationName = (req.body?.location_name || "").toString().trim();
         const customerEmail = (req.body?.customer_email || "").toString().trim();
+
+        // cart_items is JSON string from /cart.js items
+        const cartItemsRaw = (req.body?.cart_items || "").toString();
+        let cartItems = [];
+        try {
+          const parsed = JSON.parse(cartItemsRaw || "[]");
+          if (Array.isArray(parsed)) cartItems = parsed;
+        } catch {
+          cartItems = [];
+        }
+
+        if (!note && (!cartItems || cartItems.length === 0)) {
+          return json(res, 400, { ok: false, error: "Please paste items or add items to cart." });
+        }
 
         let header = "Order Pad Submission";
         header += `\nCustomer ID: ${customerId}`;
@@ -437,7 +446,28 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
         if (companyName) header += `\nCompany: ${companyName}`;
         if (locationName) header += `\nLocation: ${locationName}`;
 
-        const finalNote = header + "\n\n" + note;
+        // Optional: add cart summary to note for staff clarity
+        if (cartItems.length) {
+          header += `\n\nCart Items:`;
+          for (const it of cartItems) {
+            const sku = (it?.sku || it?.variant_sku || "").toString().trim();
+            const title = (it?.product_title || it?.title || "").toString().trim();
+            const qty = Number(it?.quantity || 0);
+            header += `\n- ${qty} x ${sku || title || "Item"}`;
+          }
+        }
+
+        const finalNote = header + (note ? "\n\n---\n" + note : "");
+
+        // Build lineItems from cart variants
+        const lineItemsFromCart = cartItems
+          .map((it) => {
+            const variantIdNum = Number(it?.variant_id || 0);
+            const qty = Number(it?.quantity || 0);
+            if (!variantIdNum || !Number.isFinite(qty) || qty <= 0) return null;
+            return { variantId: `gid://shopify/ProductVariant/${variantIdNum}`, quantity: qty };
+          })
+          .filter(Boolean);
 
         const mutation = `
           mutation DraftOrderCreate($input: DraftOrderInput!) {
@@ -448,23 +478,20 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
           }
         `;
 
-        // ✅ FIX: attach customer + email at creation time
-        const customerGid = customerGidFromNumericId(customerId);
-
         const input = {
-          // ✅ FIX
-          customerId: customerGid,
-          // optional, but helps ensure email is present immediately
+          customerId: customerGidFromNumericId(customerId),
           ...(customerEmail ? { email: customerEmail } : {}),
-
           note: finalNote,
-          lineItems: [
-            {
-              title: "Order Pad Submission",
-              quantity: 1,
-              originalUnitPrice: "0.00",
-            },
-          ],
+
+          lineItems: lineItemsFromCart.length
+            ? lineItemsFromCart
+            : [
+                {
+                  title: "Order Pad Submission",
+                  quantity: 1,
+                  originalUnitPrice: "0.00",
+                },
+              ],
         };
 
         try {
