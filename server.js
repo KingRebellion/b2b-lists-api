@@ -1,5 +1,5 @@
 // server.js (ESM) — Express + Postgres + Shopify App Proxy verification
-// Supports actions: list, get, upsert, delete, orderify, draftpad, upload_po
+// Supports actions: list, get, upsert, delete, orderify, draftpad
 //
 // App Proxy endpoint: /proxy
 // Shopify proxy URL: https://YOUR-STORE.myshopify.com/apps/b2b-lists/proxy
@@ -7,32 +7,34 @@
 // ENV required:
 //   DATABASE_URL
 //   SHOPIFY_APP_SECRET
-//   SHOPIFY_STORE_DOMAIN
-//   SHOPIFY_ADMIN_ACCESS_TOKEN  (Admin API token w/ write_files for uploads)
+//   SHOPIFY_STORE_DOMAIN          (e.g. mississauga-hardware-wholesale.myshopify.com)
+//   SHOPIFY_ADMIN_ACCESS_TOKEN    (Admin API access token)
+//
+// Optional:
+//   PORT (default 3000)
 
 import express from "express";
 import crypto from "crypto";
 import pg from "pg";
-import multer from "multer";
 
 const { Pool } = pg;
 
 const app = express();
 app.set("trust proxy", 1);
 
-// App Proxy: keep urlencoded enabled
+// IMPORTANT: App Proxy often breaks with JSON bodies; keep urlencoded enabled.
 app.use(express.urlencoded({ extended: false }));
-
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 15 * 1024 * 1024 }, // 15MB
-});
 
 const PORT = process.env.PORT || 3000;
 const DATABASE_URL = process.env.DATABASE_URL;
 const SHOPIFY_APP_SECRET = process.env.SHOPIFY_APP_SECRET;
 const SHOPIFY_STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN;
 const SHOPIFY_ADMIN_ACCESS_TOKEN = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
+
+if (!DATABASE_URL) console.warn("Missing env DATABASE_URL");
+if (!SHOPIFY_APP_SECRET) console.warn("Missing env SHOPIFY_APP_SECRET");
+if (!SHOPIFY_STORE_DOMAIN) console.warn("Missing env SHOPIFY_STORE_DOMAIN");
+if (!SHOPIFY_ADMIN_ACCESS_TOKEN) console.warn("Missing env SHOPIFY_ADMIN_ACCESS_TOKEN");
 
 const pool = new Pool({
   connectionString: DATABASE_URL,
@@ -43,7 +45,7 @@ const pool = new Pool({
 async function ensureSchema() {
   try {
     await pool.query(`CREATE EXTENSION IF NOT EXISTS pgcrypto;`);
-  } catch {}
+  } catch (e) {}
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS lists (
@@ -69,6 +71,7 @@ async function ensureSchema() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_lists_customer_id ON lists(customer_id);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_list_items_list_id ON list_items(list_id);`);
 }
+
 ensureSchema().catch((e) => console.error("Schema init failed:", e));
 
 // ---------- helpers ----------
@@ -76,6 +79,18 @@ function json(res, status, obj) {
   res.status(status);
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   res.send(JSON.stringify(obj));
+}
+
+function normalizeCustomerId(raw) {
+  if (raw == null) return null;
+  const s = String(raw).trim();
+  if (!s) return null;
+  if (!/^\d+$/.test(s)) return null;
+  return s;
+}
+
+function nowIso() {
+  return Date.now().toString();
 }
 
 function safeParseItems(itemsStr) {
@@ -95,21 +110,21 @@ function safeParseItems(itemsStr) {
   }
 }
 
-function normalizeCustomerId(raw) {
-  if (raw == null) return null;
-  const s = String(raw).trim();
-  if (!s) return null;
-  if (!/^\d+$/.test(s)) return null;
-  return s;
+function safeParseCartItems(cartItemsStr) {
+  if (!cartItemsStr) return [];
+  try {
+    const arr = JSON.parse(cartItemsStr);
+    if (!Array.isArray(arr)) return [];
+    return arr;
+  } catch {
+    return [];
+  }
 }
 
-function customerGidFromNumericId(customerIdNumeric) {
-  if (!customerIdNumeric) return null;
-  return `gid://shopify/Customer/${customerIdNumeric}`;
-}
-
-function nowIso() {
-  return Date.now().toString();
+function toVariantGid(variantId) {
+  const n = Number.parseInt(String(variantId || "").trim(), 10);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return `gid://shopify/ProductVariant/${n}`;
 }
 
 // ---------- Shopify Admin GraphQL ----------
@@ -131,7 +146,7 @@ async function shopifyGql(query, variables = {}) {
   });
 
   const text = await r.text();
-  let data;
+  let data = null;
   try {
     data = JSON.parse(text);
   } catch {
@@ -139,91 +154,16 @@ async function shopifyGql(query, variables = {}) {
     throw new Error(`Non-JSON from Shopify Admin API (${r.status}): ${snippet}`);
   }
 
-  if (!r.ok) throw new Error(data?.errors?.[0]?.message || `Shopify Admin API HTTP ${r.status}`);
-  if (Array.isArray(data?.errors) && data.errors.length) {
+  if (!r.ok) {
+    throw new Error(data?.errors?.[0]?.message || `Shopify Admin API HTTP ${r.status}`);
+  }
+
+  if (data?.errors && Array.isArray(data.errors) && data.errors.length) {
     const msg = data.errors.map((e) => e.message).filter(Boolean).join(" | ");
     throw new Error(msg || "Shopify GraphQL error");
   }
 
   return data.data;
-}
-
-// ---------- Shopify Files upload (stagedUploadsCreate -> upload -> fileCreate) ----------
-async function uploadToShopifyFiles({ filename, mimeType, buffer }) {
-  const stagedMutation = `
-    mutation stagedUploadsCreate($input: [StagedUploadInput!]!) {
-      stagedUploadsCreate(input: $input) {
-        stagedTargets {
-          url
-          resourceUrl
-          parameters { name value }
-        }
-        userErrors { field message }
-      }
-    }
-  `;
-
-  const stagedInput = [
-    {
-      resource: "FILE",
-      filename,
-      mimeType,
-      httpMethod: "POST",
-    },
-  ];
-
-  const staged = await shopifyGql(stagedMutation, { input: stagedInput });
-  const out = staged?.stagedUploadsCreate;
-  const errs = out?.userErrors || [];
-  if (errs.length) throw new Error(errs.map((e) => e.message).filter(Boolean).join(" | ") || "stagedUploadsCreate failed");
-
-  const target = out?.stagedTargets?.[0];
-  if (!target?.url || !target?.resourceUrl || !Array.isArray(target.parameters)) {
-    throw new Error("Missing staged upload target");
-  }
-
-  const form = new FormData();
-  for (const p of target.parameters) form.append(p.name, p.value);
-  form.append("file", new Blob([buffer], { type: mimeType }), filename);
-
-  const up = await fetch(target.url, { method: "POST", body: form });
-  if (!up.ok) {
-    const txt = await up.text().catch(() => "");
-    throw new Error(`Staged upload failed (${up.status}): ${(txt || "").slice(0, 200)}`);
-  }
-
-  const fileCreateMutation = `
-    mutation fileCreate($files: [FileCreateInput!]!) {
-      fileCreate(files: $files) {
-        files {
-          __typename
-          ... on GenericFile { id url }
-          ... on MediaImage { id image { url } }
-        }
-        userErrors { field message }
-      }
-    }
-  `;
-
-  const created = await shopifyGql(fileCreateMutation, {
-    files: [
-      {
-        originalSource: target.resourceUrl,
-        contentType: "FILE",
-        alt: filename,
-      },
-    ],
-  });
-
-  const fc = created?.fileCreate;
-  const fcErrs = fc?.userErrors || [];
-  if (fcErrs.length) throw new Error(fcErrs.map((e) => e.message).filter(Boolean).join(" | ") || "fileCreate failed");
-
-  const f = fc?.files?.[0];
-  const url = f?.url || f?.image?.url || null;
-  if (!url) throw new Error("File created but URL not returned yet");
-
-  return { url };
 }
 
 // ---------- Shopify App Proxy signature verification ----------
@@ -270,13 +210,16 @@ app.get("/proxy-ping/proxy", (req, res) =>
   })
 );
 
-app.all("/proxy", verifyAppProxy, upload.single("file"), async (req, res) => {
+// Main App Proxy endpoint
+app.all("/proxy", verifyAppProxy, async (req, res) => {
   try {
     const action = (req.query.action || req.query.actions || "").toString().trim();
     const method = req.method.toUpperCase();
 
     const customerId = normalizeCustomerId(req.query.customer_id || req.body?.customer_id);
-    if (!customerId) return json(res, 400, { ok: false, error: "Missing customer_id" });
+    if (!customerId) {
+      return json(res, 400, { ok: false, error: "Missing customer_id" });
+    }
 
     const allowed = {
       list: ["GET"],
@@ -285,7 +228,6 @@ app.all("/proxy", verifyAppProxy, upload.single("file"), async (req, res) => {
       upsert: ["POST"],
       delete: ["POST"],
       draftpad: ["POST"],
-      upload_po: ["POST"],
     };
 
     if (!action || !allowed[action] || !allowed[action].includes(method)) {
@@ -303,7 +245,11 @@ app.all("/proxy", verifyAppProxy, upload.single("file"), async (req, res) => {
             l.id,
             l.name,
             EXTRACT(EPOCH FROM l.updated_at) * 1000 AS updated_at_ms,
-            (SELECT COUNT(*) FROM list_items li WHERE li.list_id = l.id) AS item_count
+            (
+              SELECT COUNT(*)
+              FROM list_items li
+              WHERE li.list_id = l.id
+            ) AS item_count
           FROM lists l
           WHERE l.customer_id = $1
           ORDER BY l.updated_at DESC
@@ -353,7 +299,9 @@ app.all("/proxy", verifyAppProxy, upload.single("file"), async (req, res) => {
           list: {
             id: listRes.rows[0].id,
             name: listRes.rows[0].name,
-            updated_at: listRes.rows[0].updated_at_ms ? String(Math.trunc(listRes.rows[0].updated_at_ms)) : null,
+            updated_at: listRes.rows[0].updated_at_ms
+              ? String(Math.trunc(listRes.rows[0].updated_at_ms))
+              : null,
             items: itemsRes.rows.map((x) => ({ sku: x.sku, quantity: Number(x.quantity || 1) })),
           },
         });
@@ -386,14 +334,22 @@ app.all("/proxy", verifyAppProxy, upload.single("file"), async (req, res) => {
 
             if (!up.rows.length) {
               const ins = await client.query(
-                `INSERT INTO lists (customer_id, name) VALUES ($1, $2) RETURNING id`,
+                `
+                INSERT INTO lists (customer_id, name)
+                VALUES ($1, $2)
+                RETURNING id
+              `,
                 [customerId, name]
               );
               listId = ins.rows[0].id;
             }
           } else {
             const ins = await client.query(
-              `INSERT INTO lists (customer_id, name) VALUES ($1, $2) RETURNING id`,
+              `
+              INSERT INTO lists (customer_id, name)
+              VALUES ($1, $2)
+              RETURNING id
+            `,
               [customerId, name]
             );
             listId = ins.rows[0].id;
@@ -409,7 +365,13 @@ app.all("/proxy", verifyAppProxy, upload.single("file"), async (req, res) => {
             params.push(listId, it.sku, it.quantity);
           }
 
-          await client.query(`INSERT INTO list_items (list_id, sku, quantity) VALUES ${values.join(",")}`, params);
+          await client.query(
+            `
+            INSERT INTO list_items (list_id, sku, quantity)
+            VALUES ${values.join(",")}
+          `,
+            params
+          );
 
           await client.query("COMMIT");
           return json(res, 200, { ok: true, list_id: listId });
@@ -427,7 +389,11 @@ app.all("/proxy", verifyAppProxy, upload.single("file"), async (req, res) => {
         if (!listId) return json(res, 400, { ok: false, error: "Missing list_id" });
 
         const del = await pool.query(
-          `DELETE FROM lists WHERE id = $1 AND customer_id = $2 RETURNING id`,
+          `
+          DELETE FROM lists
+          WHERE id = $1 AND customer_id = $2
+          RETURNING id
+        `,
           [listId, customerId]
         );
 
@@ -446,7 +412,12 @@ app.all("/proxy", verifyAppProxy, upload.single("file"), async (req, res) => {
         if (!listRes.rows.length) return json(res, 404, { ok: false, error: "List not found" });
 
         const itemsRes = await pool.query(
-          `SELECT sku, quantity FROM list_items WHERE list_id = $1 ORDER BY created_at ASC`,
+          `
+          SELECT sku, quantity
+          FROM list_items
+          WHERE list_id = $1
+          ORDER BY created_at ASC
+        `,
           [listId]
         );
 
@@ -456,99 +427,59 @@ app.all("/proxy", verifyAppProxy, upload.single("file"), async (req, res) => {
         });
       }
 
-      case "upload_po": {
-        const f = req.file;
-        if (!f || !f.buffer) return json(res, 400, { ok: false, error: "Missing file" });
-
-        const filename = (f.originalname || "po-upload").toString();
-        const mimeType = (f.mimetype || "application/octet-stream").toString();
-
-        try {
-          const uploaded = await uploadToShopifyFiles({ filename, mimeType, buffer: f.buffer });
-          return json(res, 200, { ok: true, url: uploaded.url });
-        } catch (e) {
-          console.error("upload_po failed:", e);
-          return json(res, 200, { ok: false, error: e.message || "Upload failed" });
-        }
-      }
-
       case "draftpad": {
-        const note = (req.body?.note || "").toString().trim();
+        // ✅ PO/contact fields are OPTIONAL (no more Missing PO Number).
+        // ✅ Uses cart_items (from /cart.js) to create Draft lineItems via variantId.
+        // ✅ Always creates a draft (adds $0 item if cart empty).
 
+        const note = (req.body?.note || "").toString().trim();
         const companyName = (req.body?.company_name || "").toString().trim();
         const locationName = (req.body?.location_name || "").toString().trim();
         const customerEmail = (req.body?.customer_email || "").toString().trim();
 
-        const poNumber = (req.body?.po_number || "").toString().trim();
-        const siteContactName = (req.body?.site_contact_name || "").toString().trim();
-        const siteContactPhone = (req.body?.site_contact_phone || "").toString().trim();
-        const poFileUrl = (req.body?.po_file_url || "").toString().trim();
+        const cartItems = safeParseCartItems(req.body?.cart_items);
 
-        if (!poNumber) return json(res, 400, { ok: false, error: "Missing PO Number" });
-        if (!siteContactName) return json(res, 400, { ok: false, error: "Missing Site Contact Name" });
-        if (!siteContactPhone) return json(res, 400, { ok: false, error: "Missing Site Contact Phone" });
-
-        const cartItemsRaw = (req.body?.cart_items || "").toString();
-        let cartItems = [];
-        try {
-          const parsed = JSON.parse(cartItemsRaw || "[]");
-          if (Array.isArray(parsed)) cartItems = parsed;
-        } catch {
-          cartItems = [];
-        }
-
-        if (!note && (!cartItems || cartItems.length === 0)) {
-          return json(res, 400, { ok: false, error: "Please paste items or add items to cart." });
-        }
-
+        // Build header
         let header = "Order Pad Submission";
         header += `\nCustomer ID: ${customerId}`;
         if (customerEmail) header += `\nEmail: ${customerEmail}`;
         if (companyName) header += `\nCompany: ${companyName}`;
         if (locationName) header += `\nLocation: ${locationName}`;
 
-        header += `\n\nPO Number: ${poNumber}`;
-        header += `\nSite Contact: ${siteContactName}`;
-        header += `\nSite Contact Phone: ${siteContactPhone}`;
-        if (poFileUrl) header += `\nPO File: ${poFileUrl}`;
+        const finalNote = (header + "\n\n" + (note || "(No Order Pad notes provided)")).trim();
 
-        if (cartItems.length) {
-          header += `\n\nCart Items:`;
+        // Convert cart items to DraftOrder lineItems
+        const lineItems = [];
+        if (Array.isArray(cartItems) && cartItems.length) {
           for (const it of cartItems) {
-            const sku = (it?.sku || it?.variant_sku || "").toString().trim();
-            const title = (it?.product_title || it?.title || "").toString().trim();
-            const qty = Number(it?.quantity || 0);
-            header += `\n- ${qty} x ${sku || title || "Item"}`;
+            const gid = toVariantGid(it?.variant_id);
+            const qty = Number.parseInt(it?.quantity ?? 1, 10);
+            if (!gid || !Number.isFinite(qty) || qty <= 0) continue;
+            lineItems.push({ variantId: gid, quantity: qty });
           }
         }
 
-        const finalNote = header + (note ? "\n\n---\n" + note : "");
-
-        const lineItemsFromCart = cartItems
-          .map((it) => {
-            const variantIdNum = Number(it?.variant_id || 0);
-            const qty = Number(it?.quantity || 0);
-            if (!variantIdNum || !Number.isFinite(qty) || qty <= 0) return null;
-            return { variantId: `gid://shopify/ProductVariant/${variantIdNum}`, quantity: qty };
-          })
-          .filter(Boolean);
+        // Shopify requires at least 1 line item
+        if (!lineItems.length) {
+          lineItems.push({
+            title: "Order Pad Submission",
+            quantity: 1,
+            originalUnitPrice: "0.00",
+          });
+        }
 
         const mutation = `
           mutation DraftOrderCreate($input: DraftOrderInput!) {
             draftOrderCreate(input: $input) {
-              draftOrder { id name email }
+              draftOrder { id name }
               userErrors { field message }
             }
           }
         `;
 
         const input = {
-          customerId: customerGidFromNumericId(customerId),
-          ...(customerEmail ? { email: customerEmail } : {}),
           note: finalNote,
-          lineItems: lineItemsFromCart.length
-            ? lineItemsFromCart
-            : [{ title: "Order Pad Submission", quantity: 1, originalUnitPrice: "0.00" }],
+          lineItems,
         };
 
         try {
@@ -559,11 +490,17 @@ app.all("/proxy", verifyAppProxy, upload.single("file"), async (req, res) => {
           if (userErrors.length) {
             return json(res, 200, {
               ok: false,
-              error: userErrors.map((e) => e.message).filter(Boolean).join(" | ") || "Draft order not created",
+              error:
+                userErrors
+                  .map((e) => e.message)
+                  .filter(Boolean)
+                  .join(" | ") || "Draft order not created",
             });
           }
 
-          if (!out?.draftOrder?.id) return json(res, 200, { ok: false, error: "Draft order not created" });
+          if (!out?.draftOrder?.id) {
+            return json(res, 200, { ok: false, error: "Draft order not created" });
+          }
 
           return json(res, 200, {
             ok: true,
@@ -572,6 +509,7 @@ app.all("/proxy", verifyAppProxy, upload.single("file"), async (req, res) => {
           });
         } catch (e) {
           console.error("draftpad failed:", e);
+          // IMPORTANT: return 400 only for your validation issues; Shopify errors return ok:false in 200
           return json(res, 200, { ok: false, error: e.message || "Draft order not created" });
         }
       }
