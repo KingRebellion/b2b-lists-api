@@ -540,16 +540,13 @@ case "draftpad": {
   console.log("ORDERPAD DATA:", JSON.stringify(orderPadData, null, 2));
   console.log("INPUT METAFIELDS:", JSON.stringify(input.metafields, null, 2));
 
-  try {
+    try {
     const data = await shopifyGql(mutation, { input });
     const out = data?.draftOrderCreate;
     const userErrors = out?.userErrors || [];
 
     console.log("draftOrderCreate userErrors:", JSON.stringify(userErrors, null, 2));
-    console.log(
-      "draftOrderCreate metafields:",
-      JSON.stringify(out?.draftOrder?.metafields?.edges || [], null, 2)
-    );
+    console.log("draftOrderCreate metafields:", JSON.stringify(out?.draftOrder?.metafields?.edges || [], null, 2));
 
     if (userErrors.length) {
       return json(res, 200, {
@@ -562,7 +559,7 @@ case "draftpad": {
       return json(res, 200, { ok: false, error: "Draft order not created" });
     }
 
-      return json(res, 200, {
+    return json(res, 200, {
       ok: true,
       draft_order_id: out.draftOrder.id,
       draft_order_name: out.draftOrder.name || null,
@@ -570,9 +567,7 @@ case "draftpad": {
   } catch (e) {
     console.error("draftpad failed:", e);
     return json(res, 200, { ok: false, error: e.message || "Draft order not created" });
-  }
-}
-    // ✅ SAVE ORDER PAD DATA
+  }    // ✅ SAVE ORDER PAD DATA
     const orderPadData = {
       note,
       raw_lines: note ? note.split("\n").filter(Boolean) : [],
