@@ -510,30 +510,27 @@ const input = {
     lineItems,
   };
 
-  try {
-    const data = await shopifyGql(mutation, { input });
-    const out = data?.draftOrderCreate;
+try {
+  const data = await shopifyGql(mutation, { input });
+  const out = data?.draftOrderCreate;
+  const userErrors = out?.userErrors || [];
 
-    if (!out?.draftOrder?.id) {
-      return json(res, 200, { ok: false, error: "Draft order not created" });
-    }
+  console.log("draftOrderCreate userErrors:", JSON.stringify(userErrors, null, 2));
+  console.log(
+    "draftOrderCreate metafields:",
+    JSON.stringify(out?.draftOrder?.metafields?.edges || [], null, 2)
+  );
 
-const data = await shopifyGql(mutation, { input });
-const out = data?.draftOrderCreate;
-const userErrors = out?.userErrors || [];
+  if (userErrors.length) {
+    return json(res, 200, {
+      ok: false,
+      error: userErrors.map((e) => e.message).join(" | "),
+    });
+  }
 
-console.log("draftOrderCreate userErrors:", JSON.stringify(userErrors, null, 2));
-console.log(
-  "draftOrderCreate metafields:",
-  JSON.stringify(out?.draftOrder?.metafields?.edges || [], null, 2)
-);
-
-if (userErrors.length) {
-  return json(res, 200, {
-    ok: false,
-    error: userErrors.map((e) => e.message).filter(Boolean).join(" | ") || "Draft order not created",
-  });
-}
+  if (!out?.draftOrder?.id) {
+    return json(res, 200, { ok: false, error: "Draft order not created" });
+  }
 
     // ✅ SAVE ORDER PAD DATA
     const orderPadData = {
