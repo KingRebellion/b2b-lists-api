@@ -572,3 +572,13 @@ case "draftpad": {
 
 default:
   return json(res, 400, { ok: false, error: "Unsupported action" });
+    }
+  } catch (e) {
+    console.error("Proxy handler error:", e);
+    return json(res, 500, { ok: false, error: "Server error" });
+  }
+});
+
+app.use((req, res) => json(res, 404, { ok: false, error: "Not found" }));
+
+app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
