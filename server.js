@@ -575,20 +575,7 @@ try {
       po_file_url: poFileUrl
     };
 
-    try {
-      await shopifyGql(metafieldMutation, {
-        metafields: [{
-          ownerId: out.draftOrder.id,
-          namespace: "custom",
-          key: "orderpad_items",
-          type: "json",
-          value: JSON.stringify(orderPadData)
-        }]
-      });
-    } catch (e) {
-      console.error("Metafield save failed:", e);
-    }
-
+   
     return json(res, 200, {
       ok: true,
       draft_order_id: out.draftOrder.id,
