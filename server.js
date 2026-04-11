@@ -479,14 +479,29 @@ case "draftpad": {
   }
 
   const mutation = `
-    mutation DraftOrderCreate($input: DraftOrderInput!) {
-      draftOrderCreate(input: $input) {
-        draftOrder { id name }
-        userErrors { field message }
+  mutation DraftOrderCreate($input: DraftOrderInput!) {
+    draftOrderCreate(input: $input) {
+      draftOrder {
+        id
+        name
+        metafields(first: 10) {
+          edges {
+            node {
+              namespace
+              key
+              type
+              value
+            }
+          }
+        }
+      }
+      userErrors {
+        field
+        message
       }
     }
-  `;
-
+  }
+`;
  
 const input = {
     customerId: customerGidFromNumericId(customerId),
@@ -502,6 +517,23 @@ const input = {
     if (!out?.draftOrder?.id) {
       return json(res, 200, { ok: false, error: "Draft order not created" });
     }
+
+const data = await shopifyGql(mutation, { input });
+const out = data?.draftOrderCreate;
+const userErrors = out?.userErrors || [];
+
+console.log("draftOrderCreate userErrors:", JSON.stringify(userErrors, null, 2));
+console.log(
+  "draftOrderCreate metafields:",
+  JSON.stringify(out?.draftOrder?.metafields?.edges || [], null, 2)
+);
+
+if (userErrors.length) {
+  return json(res, 200, {
+    ok: false,
+    error: userErrors.map((e) => e.message).filter(Boolean).join(" | ") || "Draft order not created",
+  });
+}
 
     // ✅ SAVE ORDER PAD DATA
     const orderPadData = {
