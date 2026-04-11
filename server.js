@@ -477,7 +477,8 @@ case "draftpad": {
       originalUnitPrice: "0.00",
     });
   }
-
+console.log("ORDERPAD DATA:", JSON.stringify(orderPadData, null, 2));
+console.log("INPUT METAFIELDS:", JSON.stringify(input.metafields, null, 2));
   const mutation = `
   mutation DraftOrderCreate($input: DraftOrderInput!) {
     draftOrderCreate(input: $input) {
