@@ -540,7 +540,7 @@ case "draftpad": {
   console.log("ORDERPAD DATA:", JSON.stringify(orderPadData, null, 2));
   console.log("INPUT METAFIELDS:", JSON.stringify(input.metafields, null, 2));
 
-    try {
+      try {
     const data = await shopifyGql(mutation, { input });
     const out = data?.draftOrderCreate;
     const userErrors = out?.userErrors || [];
@@ -567,15 +567,8 @@ case "draftpad": {
   } catch (e) {
     console.error("draftpad failed:", e);
     return json(res, 200, { ok: false, error: e.message || "Draft order not created" });
-  }         default:
-        return json(res, 400, { ok: false, error: "Unsupported action" });
-    }
-  } catch (e) {
-    console.error("Proxy handler error:", e);
-    return json(res, 500, { ok: false, error: "Server error" });
   }
-});
+}
 
-app.use((req, res) => json(res, 404, { ok: false, error: "Not found" }));
-
-app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+default:
+  return json(res, 400, { ok: false, error: "Unsupported action" });
