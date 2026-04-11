@@ -562,7 +562,7 @@ case "draftpad": {
       return json(res, 200, { ok: false, error: "Draft order not created" });
     }
 
-    return json(res, 200, {
+      return json(res, 200, {
       ok: true,
       draft_order_id: out.draftOrder.id,
       draft_order_name: out.draftOrder.name || null,
