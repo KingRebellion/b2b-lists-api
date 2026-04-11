@@ -540,7 +540,7 @@ case "draftpad": {
   console.log("ORDERPAD DATA:", JSON.stringify(orderPadData, null, 2));
   console.log("INPUT METAFIELDS:", JSON.stringify(input.metafields, null, 2));
 
-      try {
+  try {
     const data = await shopifyGql(mutation, { input });
     const out = data?.draftOrderCreate;
     const userErrors = out?.userErrors || [];
