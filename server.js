@@ -566,6 +566,10 @@ case "draftpad": {
       ok: true,
       draft_order_id: out.draftOrder.id,
       draft_order_name: out.draftOrder.name || null,
+       return json(res, 200, {
+      ok: true,
+      draft_order_id: out.draftOrder.id,
+      draft_order_name: out.draftOrder.name || null,
     });
   } catch (e) {
     console.error("draftpad failed:", e);
