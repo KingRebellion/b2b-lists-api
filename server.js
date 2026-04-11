@@ -487,41 +487,21 @@ case "draftpad": {
     }
   `;
 
-  
-
-  const orderPadData = {
-  note,
-  raw_lines: note ? note.split("\n").map((line) => line.trim()).filter(Boolean) : [],
-  cart_items: (cartItems || []).map((it) => ({
-    sku: (it?.sku || it?.variant_sku || "").toString().trim(),
-    title: (it?.product_title || it?.title || "").toString().trim(),
-    quantity: Number(it?.quantity || 1),
-    variant_id: it?.variant_id ? String(it.variant_id) : "",
-  })),
-  po_number: poNumber || "",
-  contact_name: siteContactName || "",
-  contact_phone: siteContactPhone || "",
-  po_file_url: poFileUrl || "",
-  company_name: companyName || "",
-  location_name: locationName || "",
-  customer_email: customerEmail || "",
-  created_at: new Date().toISOString(),
-};
-
+ 
 const input = {
-  customerId: customerGidFromNumericId(customerId),
-  ...(customerEmail ? { email: customerEmail } : {}),
-  note: finalNote,
-  lineItems,
-  metafields: [
-    {
-      namespace: "custom",
-      key: "orderpad_items",
-      type: "json",
-      value: JSON.stringify(orderPadData),
-    },
-  ],
-};
+    customerId: customerGidFromNumericId(customerId),
+    ...(customerEmail ? { email: customerEmail } : {}),
+    note: finalNote,
+    lineItems,
+  };
+
+  try {
+    const data = await shopifyGql(mutation, { input });
+    const out = data?.draftOrderCreate;
+
+    if (!out?.draftOrder?.id) {
+      return json(res, 200, { ok: false, error: "Draft order not created" });
+    }
 
     // ✅ SAVE ORDER PAD DATA
     const orderPadData = {
