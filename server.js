@@ -477,89 +477,101 @@ case "draftpad": {
       originalUnitPrice: "0.00",
     });
   }
-console.log("ORDERPAD DATA:", JSON.stringify(orderPadData, null, 2));
-console.log("INPUT METAFIELDS:", JSON.stringify(input.metafields, null, 2));
+
   const mutation = `
-  mutation DraftOrderCreate($input: DraftOrderInput!) {
-    draftOrderCreate(input: $input) {
-      draftOrder {
-        id
-        name
-        metafields(first: 10) {
-          edges {
-            node {
-              namespace
-              key
-              type
-              value
+    mutation DraftOrderCreate($input: DraftOrderInput!) {
+      draftOrderCreate(input: $input) {
+        draftOrder {
+          id
+          name
+          metafields(first: 10) {
+            edges {
+              node {
+                namespace
+                key
+                type
+                value
+              }
             }
           }
         }
-      }
-      userErrors {
-        field
-        message
+        userErrors {
+          field
+          message
+        }
       }
     }
-  }
-`;
- 
-const orderPadData = {
-  note,
-  raw_lines: note ? note.split("\n").map((line) => line.trim()).filter(Boolean) : [],
-  cart_items: (cartItems || []).map((it) => ({
-    sku: (it?.sku || it?.variant_sku || "").toString().trim(),
-    title: (it?.product_title || it?.title || "").toString().trim(),
-    quantity: Number(it?.quantity || 1),
-    variant_id: it?.variant_id ? String(it.variant_id) : "",
-  })),
-  po_number: poNumber || "",
-  contact_name: siteContactName || "",
-  contact_phone: siteContactPhone || "",
-  po_file_url: poFileUrl || "",
-  company_name: companyName || "",
-  location_name: locationName || "",
-  customer_email: customerEmail || "",
-  created_at: new Date().toISOString(),
-};
+  `;
 
-const input = {
-  customerId: customerGidFromNumericId(customerId),
-  ...(customerEmail ? { email: customerEmail } : {}),
-  note: finalNote,
-  lineItems,
-  metafields: [
-    {
-      namespace: "custom",
-      key: "orderpad_items",
-      type: "json",
-      value: JSON.stringify(orderPadData),
-    },
-  ],
-};
+  const orderPadData = {
+    note,
+    raw_lines: note ? note.split("\n").map((line) => line.trim()).filter(Boolean) : [],
+    cart_items: (cartItems || []).map((it) => ({
+      sku: (it?.sku || it?.variant_sku || "").toString().trim(),
+      title: (it?.product_title || it?.title || "").toString().trim(),
+      quantity: Number(it?.quantity || 1),
+      variant_id: it?.variant_id ? String(it.variant_id) : "",
+    })),
+    po_number: poNumber || "",
+    contact_name: siteContactName || "",
+    contact_phone: siteContactPhone || "",
+    po_file_url: poFileUrl || "",
+    company_name: companyName || "",
+    location_name: locationName || "",
+    customer_email: customerEmail || "",
+    created_at: new Date().toISOString(),
+  };
 
-try {
-  const data = await shopifyGql(mutation, { input });
-  const out = data?.draftOrderCreate;
-  const userErrors = out?.userErrors || [];
+  const input = {
+    customerId: customerGidFromNumericId(customerId),
+    ...(customerEmail ? { email: customerEmail } : {}),
+    note: finalNote,
+    lineItems,
+    metafields: [
+      {
+        namespace: "custom",
+        key: "orderpad_items",
+        type: "json",
+        value: JSON.stringify(orderPadData),
+      },
+    ],
+  };
 
-  console.log("draftOrderCreate userErrors:", JSON.stringify(userErrors, null, 2));
-  console.log(
-    "draftOrderCreate metafields:",
-    JSON.stringify(out?.draftOrder?.metafields?.edges || [], null, 2)
-  );
+  console.log("ORDERPAD DATA:", JSON.stringify(orderPadData, null, 2));
+  console.log("INPUT METAFIELDS:", JSON.stringify(input.metafields, null, 2));
 
-  if (userErrors.length) {
+  try {
+    const data = await shopifyGql(mutation, { input });
+    const out = data?.draftOrderCreate;
+    const userErrors = out?.userErrors || [];
+
+    console.log("draftOrderCreate userErrors:", JSON.stringify(userErrors, null, 2));
+    console.log(
+      "draftOrderCreate metafields:",
+      JSON.stringify(out?.draftOrder?.metafields?.edges || [], null, 2)
+    );
+
+    if (userErrors.length) {
+      return json(res, 200, {
+        ok: false,
+        error: userErrors.map((e) => e.message).join(" | "),
+      });
+    }
+
+    if (!out?.draftOrder?.id) {
+      return json(res, 200, { ok: false, error: "Draft order not created" });
+    }
+
     return json(res, 200, {
-      ok: false,
-      error: userErrors.map((e) => e.message).join(" | "),
+      ok: true,
+      draft_order_id: out.draftOrder.id,
+      draft_order_name: out.draftOrder.name || null,
     });
+  } catch (e) {
+    console.error("draftpad failed:", e);
+    return json(res, 200, { ok: false, error: e.message || "Draft order not created" });
   }
-
-  if (!out?.draftOrder?.id) {
-    return json(res, 200, { ok: false, error: "Draft order not created" });
-  }
-
+}
     // ✅ SAVE ORDER PAD DATA
     const orderPadData = {
       note,
