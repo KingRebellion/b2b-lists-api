@@ -567,34 +567,7 @@ case "draftpad": {
   } catch (e) {
     console.error("draftpad failed:", e);
     return json(res, 200, { ok: false, error: e.message || "Draft order not created" });
-  }    // ✅ SAVE ORDER PAD DATA
-    const orderPadData = {
-      note,
-      raw_lines: note ? note.split("\n").filter(Boolean) : [],
-      cart_items: (cartItems || []).map(it => ({
-        sku: it?.sku || "",
-        title: it?.title || "",
-        quantity: it?.quantity || 1
-      })),
-      po_number: poNumber,
-      contact_name: siteContactName,
-      contact_phone: siteContactPhone,
-      po_file_url: poFileUrl
-    };
-
-   
-    return json(res, 200, {
-      ok: true,
-      draft_order_id: out.draftOrder.id,
-      draft_order_name: out.draftOrder.name || null,
-    });
-
-  } catch (e) {
-    console.error("draftpad failed:", e);
-    return json(res, 200, { ok: false, error: e.message || "Draft order not created" });
-  }
-}
-      default:
+  }         default:
         return json(res, 400, { ok: false, error: "Unsupported action" });
     }
   } catch (e) {
