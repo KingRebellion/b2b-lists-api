@@ -2,3 +2,5 @@
 .env.*
 replacements.txt
 replacements*.txt
+node_modules/
+.env

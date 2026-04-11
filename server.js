@@ -427,93 +427,126 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
         });
       }
 
-      case "draftpad": {
-        // ✅ PO/contact fields are OPTIONAL (no more Missing PO Number).
-        // ✅ Uses cart_items (from /cart.js) to create Draft lineItems via variantId.
-        // ✅ Always creates a draft (adds $0 item if cart empty).
+case "draftpad": {
+  const note = (req.body?.note || "").toString().trim();
+  const companyName = (req.body?.company_name || "").toString().trim();
+  const locationName = (req.body?.location_name || "").toString().trim();
+  const customerEmail = (req.body?.customer_email || "").toString().trim();
 
-        const note = (req.body?.note || "").toString().trim();
-        const companyName = (req.body?.company_name || "").toString().trim();
-        const locationName = (req.body?.location_name || "").toString().trim();
-        const customerEmail = (req.body?.customer_email || "").toString().trim();
+  const poNumber = (req.body?.po_number || "").toString().trim();
+  const siteContactName = (req.body?.site_contact_name || "").toString().trim();
+  const siteContactPhone = (req.body?.site_contact_phone || "").toString().trim();
+  const poFileUrl = (req.body?.po_file_url || "").toString().trim();
 
-        const cartItems = safeParseCartItems(req.body?.cart_items);
+  const cartItems = safeParseCartItems(req.body?.cart_items);
 
-        // Build header
-        let header = "Order Pad Submission";
-        header += `\nCustomer ID: ${customerId}`;
-        if (customerEmail) header += `\nEmail: ${customerEmail}`;
-        if (companyName) header += `\nCompany: ${companyName}`;
-        if (locationName) header += `\nLocation: ${locationName}`;
+  if (!note && (!cartItems || cartItems.length === 0)) {
+    return json(res, 400, { ok: false, error: "Please paste items or add items to cart." });
+  }
 
-        const finalNote = (header + "\n\n" + (note || "(No Order Pad notes provided)")).trim();
+  let header = "Order Pad Submission";
+  header += `\nCustomer ID: ${customerId}`;
+  if (customerEmail) header += `\nEmail: ${customerEmail}`;
+  if (companyName) header += `\nCompany: ${companyName}`;
+  if (locationName) header += `\nLocation: ${locationName}`;
+  if (poNumber) header += `\nPO Number: ${poNumber}`;
+  if (siteContactName) header += `\nSite Contact: ${siteContactName}`;
+  if (siteContactPhone) header += `\nSite Contact Phone: ${siteContactPhone}`;
+  if (poFileUrl) header += `\nPO File: ${poFileUrl}`;
 
-        // Convert cart items to DraftOrder lineItems
-        const lineItems = [];
-        if (Array.isArray(cartItems) && cartItems.length) {
-          for (const it of cartItems) {
-            const gid = toVariantGid(it?.variant_id);
-            const qty = Number.parseInt(it?.quantity ?? 1, 10);
-            if (!gid || !Number.isFinite(qty) || qty <= 0) continue;
-            lineItems.push({ variantId: gid, quantity: qty });
-          }
-        }
+  const finalNote = (header + (note ? "\n\n---\n" + note : "")).trim();
 
-        // Shopify requires at least 1 line item
-        if (!lineItems.length) {
-          lineItems.push({
-            title: "Order Pad Submission",
-            quantity: 1,
-            originalUnitPrice: "0.00",
-          });
-        }
+  const lineItems = [];
+  if (Array.isArray(cartItems) && cartItems.length) {
+    for (const it of cartItems) {
+      const gid = toVariantGid(it?.variant_id);
+      const qty = Number.parseInt(it?.quantity ?? 1, 10);
+      if (!gid || !Number.isFinite(qty) || qty <= 0) continue;
+      lineItems.push({ variantId: gid, quantity: qty });
+    }
+  }
 
-        const mutation = `
-          mutation DraftOrderCreate($input: DraftOrderInput!) {
-            draftOrderCreate(input: $input) {
-              draftOrder { id name }
-              userErrors { field message }
-            }
-          }
-        `;
+  if (!lineItems.length) {
+    lineItems.push({
+      title: "Order Pad Submission",
+      quantity: 1,
+      originalUnitPrice: "0.00",
+    });
+  }
 
-        const input = {
-          note: finalNote,
-          lineItems,
-        };
-
-        try {
-          const data = await shopifyGql(mutation, { input });
-          const out = data?.draftOrderCreate;
-          const userErrors = out?.userErrors || [];
-
-          if (userErrors.length) {
-            return json(res, 200, {
-              ok: false,
-              error:
-                userErrors
-                  .map((e) => e.message)
-                  .filter(Boolean)
-                  .join(" | ") || "Draft order not created",
-            });
-          }
-
-          if (!out?.draftOrder?.id) {
-            return json(res, 200, { ok: false, error: "Draft order not created" });
-          }
-
-          return json(res, 200, {
-            ok: true,
-            draft_order_id: out.draftOrder.id,
-            draft_order_name: out.draftOrder.name,
-          });
-        } catch (e) {
-          console.error("draftpad failed:", e);
-          // IMPORTANT: return 400 only for your validation issues; Shopify errors return ok:false in 200
-          return json(res, 200, { ok: false, error: e.message || "Draft order not created" });
-        }
+  const mutation = `
+    mutation DraftOrderCreate($input: DraftOrderInput!) {
+      draftOrderCreate(input: $input) {
+        draftOrder { id name }
+        userErrors { field message }
       }
+    }
+  `;
 
+  const metafieldMutation = `
+    mutation setOrderPadMetafield($metafields: [MetafieldsSetInput!]!) {
+      metafieldsSet(metafields: $metafields) {
+        metafields { id }
+        userErrors { field message }
+      }
+    }
+  `;
+
+  const input = {
+    customerId: customerGidFromNumericId(customerId),
+    ...(customerEmail ? { email: customerEmail } : {}),
+    note: finalNote,
+    lineItems,
+  };
+
+  try {
+    const data = await shopifyGql(mutation, { input });
+    const out = data?.draftOrderCreate;
+
+    if (!out?.draftOrder?.id) {
+      return json(res, 200, { ok: false, error: "Draft order not created" });
+    }
+
+    // ✅ SAVE ORDER PAD DATA
+    const orderPadData = {
+      note,
+      raw_lines: note ? note.split("\n").filter(Boolean) : [],
+      cart_items: (cartItems || []).map(it => ({
+        sku: it?.sku || "",
+        title: it?.title || "",
+        quantity: it?.quantity || 1
+      })),
+      po_number: poNumber,
+      contact_name: siteContactName,
+      contact_phone: siteContactPhone,
+      po_file_url: poFileUrl
+    };
+
+    try {
+      await shopifyGql(metafieldMutation, {
+        metafields: [{
+          ownerId: out.draftOrder.id,
+          namespace: "custom",
+          key: "orderpad_items",
+          type: "json",
+          value: JSON.stringify(orderPadData)
+        }]
+      });
+    } catch (e) {
+      console.error("Metafield save failed:", e);
+    }
+
+    return json(res, 200, {
+      ok: true,
+      draft_order_id: out.draftOrder.id,
+      draft_order_name: out.draftOrder.name || null,
+    });
+
+  } catch (e) {
+    console.error("draftpad failed:", e);
+    return json(res, 200, { ok: false, error: e.message || "Draft order not created" });
+  }
+}
       default:
         return json(res, 400, { ok: false, error: "Unsupported action" });
     }
