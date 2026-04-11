@@ -80,6 +80,10 @@ function json(res, status, obj) {
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   res.send(JSON.stringify(obj));
 }
+function customerGidFromNumericId(customerIdNumeric) {
+  if (!customerIdNumeric) return null;
+  return `gid://shopify/Customer/${customerIdNumeric}`;
+}
 
 function normalizeCustomerId(raw) {
   if (raw == null) return null;
