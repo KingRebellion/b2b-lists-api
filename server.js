@@ -208,17 +208,19 @@ function verifyAppProxy(req, res, next) {
 }
 
 // ---------- Shopify Webhook verification ----------
-function verifyWebhookHmac(rawBody, hmacHeader) {
+function verifyWebhookHmac(rawBodyBuffer, hmacHeader) {
   if (!SHOPIFY_APP_SECRET) return false;
   if (!hmacHeader) return false;
+  if (!rawBodyBuffer) return false;
 
   const digest = crypto
     .createHmac("sha256", SHOPIFY_APP_SECRET)
-    .update(rawBody)
+    .update(rawBodyBuffer)
     .digest("base64");
 
   const a = Buffer.from(digest, "utf8");
   const b = Buffer.from(hmacHeader, "utf8");
+
   if (a.length !== b.length) return false;
   return crypto.timingSafeEqual(a, b);
 }
@@ -336,12 +338,17 @@ app.get("/register-orders-create-webhook", async (req, res) => {
 });
 
 // Shopify orders/create webhook
-app.post("/webhooks/orders-create", express.raw({ type: "application/json" }), async (req, res) => {
+app.post("/webhooks/orders-create", express.raw({ type: "*/*" }), async (req, res) => {
   try {
+    console.log("orders-create webhook hit");
+    console.log("orders-create webhook topic:", req.get("X-Shopify-Topic"));
+    console.log("orders-create webhook shop:", req.get("X-Shopify-Shop-Domain"));
+
     const hmacHeader = req.get("X-Shopify-Hmac-SHA256") || "";
     const rawBody = req.body;
 
     if (!verifyWebhookHmac(rawBody, hmacHeader)) {
+      console.error("orders-create webhook invalid HMAC");
       return res.status(401).send("Invalid webhook HMAC");
     }
 
@@ -405,7 +412,6 @@ app.post("/webhooks/orders-create", express.raw({ type: "application/json" }), a
     return res.status(500).send("Server error");
   }
 });
-
 // Main App Proxy endpoint
 app.all("/proxy", verifyAppProxy, async (req, res) => {
   try {
