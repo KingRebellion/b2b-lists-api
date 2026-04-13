@@ -245,7 +245,7 @@ function extractOrderPadJsonFromNote(note) {
   return result;
 }
 
-// ---------- Webhook route FIRST ----------
+// ---------- webhook route FIRST ----------
 app.post("/webhooks/orders-create", express.raw({ type: "application/json" }), async (req, res) => {
   try {
     console.log("orders-create webhook hit");
@@ -255,10 +255,10 @@ app.post("/webhooks/orders-create", express.raw({ type: "application/json" }), a
     const hmacHeader = req.get("X-Shopify-Hmac-SHA256") || "";
     const rawBody = req.body;
 
-   if (!verifyWebhookHmac(rawBody, hmacHeader)) {
-  console.warn("⚠️ HMAC FAILED — TEMPORARILY BYPASSED");
-  // continue anyway
-}
+    if (!verifyWebhookHmac(rawBody, hmacHeader)) {
+      console.error("orders-create webhook invalid HMAC");
+      return res.status(401).send("Invalid HMAC");
+    }
 
     const payload = JSON.parse(rawBody.toString("utf8"));
     const orderId = payload?.id;
@@ -367,6 +367,60 @@ app.get("/proxy-ping/proxy", (req, res) =>
     ts: nowIso(),
   })
 );
+
+app.get("/list-webhooks", async (req, res) => {
+  try {
+    const query = `
+      query {
+        webhookSubscriptions(first: 50) {
+          edges {
+            node {
+              id
+              topic
+              endpoint {
+                __typename
+                ... on WebhookHttpEndpoint {
+                  callbackUrl
+                }
+              }
+            }
+          }
+        }
+      }
+    `;
+
+    const result = await shopifyGql(query);
+    return json(res, 200, { ok: true, result });
+  } catch (e) {
+    console.error("List webhooks failed:", e);
+    return json(res, 500, { ok: false, error: e.message || "List webhooks failed" });
+  }
+});
+
+app.get("/delete-webhook", async (req, res) => {
+  try {
+    const id = (req.query.id || "").toString().trim();
+    if (!id) return json(res, 400, { ok: false, error: "Missing id" });
+
+    const mutation = `
+      mutation webhookSubscriptionDelete($id: ID!) {
+        webhookSubscriptionDelete(id: $id) {
+          deletedWebhookSubscriptionId
+          userErrors {
+            field
+            message
+          }
+        }
+      }
+    `;
+
+    const result = await shopifyGql(mutation, { id });
+    return json(res, 200, { ok: true, result });
+  } catch (e) {
+    console.error("Delete webhook failed:", e);
+    return json(res, 500, { ok: false, error: e.message || "Delete webhook failed" });
+  }
+});
 
 app.get("/register-orders-create-webhook", async (req, res) => {
   try {
