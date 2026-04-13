@@ -20,6 +20,18 @@ import pg from "pg";
 const { Pool } = pg;
 
 const app = express();
+app.use((req, res, next) => {
+  if (req.originalUrl.startsWith("/webhooks")) {
+    let data = [];
+    req.on("data", chunk => data.push(chunk));
+    req.on("end", () => {
+      req.rawBody = Buffer.concat(data);
+      next();
+    });
+  } else {
+    next();
+  }
+});
 app.set("trust proxy", 1);
 
 // IMPORTANT: App Proxy often breaks with JSON bodies; keep urlencoded enabled.
@@ -208,23 +220,19 @@ function verifyAppProxy(req, res, next) {
 }
 
 // ---------- Shopify Webhook verification ----------
-function verifyWebhookHmac(rawBodyBuffer, hmacHeader) {
-  if (!SHOPIFY_APP_SECRET) return false;
-  if (!hmacHeader) return false;
-  if (!rawBodyBuffer) return false;
+function verifyWebhookHmac(rawBody, hmacHeader) {
+  if (!SHOPIFY_APP_SECRET || !rawBody || !hmacHeader) return false;
 
   const digest = crypto
     .createHmac("sha256", SHOPIFY_APP_SECRET)
-    .update(rawBodyBuffer)
+    .update(rawBody)
     .digest("base64");
 
-  const a = Buffer.from(digest, "utf8");
-  const b = Buffer.from(hmacHeader, "utf8");
-
-  if (a.length !== b.length) return false;
-  return crypto.timingSafeEqual(a, b);
+  return crypto.timingSafeEqual(
+    Buffer.from(digest),
+    Buffer.from(hmacHeader)
+  );
 }
-
 function extractOrderPadJsonFromNote(note) {
   if (!note) return null;
 
@@ -338,23 +346,18 @@ app.get("/register-orders-create-webhook", async (req, res) => {
 });
 
 // Shopify orders/create webhook
-app.post("/webhooks/orders-create", express.raw({ type: "application/json" }), async (req, res) => {
+app.post("/webhooks/orders-create", async (req, res) => {
   try {
     console.log("orders-create webhook hit");
-    console.log("orders-create webhook topic:", req.get("X-Shopify-Topic"));
-    console.log("orders-create webhook shop:", req.get("X-Shopify-Shop-Domain"));
 
-    const hmacHeader = req.get("X-Shopify-Hmac-SHA256") || "";
-    const rawBody = req.body;
+    const hmacHeader = req.get("X-Shopify-Hmac-SHA256");
 
-    if (!verifyWebhookHmac(rawBody, hmacHeader)) {
+    if (!verifyWebhookHmac(req.rawBody, hmacHeader)) {
       console.error("orders-create webhook invalid HMAC");
-      return res.status(401).send("Invalid webhook HMAC");
+      return res.status(401).send("Invalid HMAC");
     }
 
-    const payload = JSON.parse(rawBody.toString("utf8"));
-    const orderId = payload?.id;
-    const note = (payload?.note || "").toString();
+    const payload = JSON.parse(req.rawBody.toString("utf8"));
 
     if (!orderId) {
       return res.status(200).send("No order id");
