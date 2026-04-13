@@ -80,9 +80,15 @@ function json(res, status, obj) {
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   res.send(JSON.stringify(obj));
 }
+
 function customerGidFromNumericId(customerIdNumeric) {
   if (!customerIdNumeric) return null;
   return `gid://shopify/Customer/${customerIdNumeric}`;
+}
+
+function orderGidFromNumericId(orderIdNumeric) {
+  if (!orderIdNumeric) return null;
+  return `gid://shopify/Order/${orderIdNumeric}`;
 }
 
 function normalizeCustomerId(raw) {
@@ -201,6 +207,83 @@ function verifyAppProxy(req, res, next) {
   }
 }
 
+// ---------- Shopify Webhook verification ----------
+function verifyWebhookHmac(rawBody, hmacHeader) {
+  if (!SHOPIFY_APP_SECRET) return false;
+  if (!hmacHeader) return false;
+
+  const digest = crypto
+    .createHmac("sha256", SHOPIFY_APP_SECRET)
+    .update(rawBody)
+    .digest("base64");
+
+  const a = Buffer.from(digest, "utf8");
+  const b = Buffer.from(hmacHeader, "utf8");
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
+function extractOrderPadJsonFromNote(note) {
+  if (!note) return null;
+
+  const lines = String(note).split("\n");
+  const result = {
+    note: "",
+    raw_lines: [],
+    cart_items: [],
+    po_number: "",
+    contact_name: "",
+    contact_phone: "",
+    po_file_url: "",
+    company_name: "",
+    location_name: "",
+    customer_email: "",
+    created_at: new Date().toISOString(),
+  };
+
+  let seenDivider = false;
+
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line) continue;
+
+    if (line === "---") {
+      seenDivider = true;
+      continue;
+    }
+
+    if (!seenDivider) {
+      if (line.startsWith("Email: ")) result.customer_email = line.replace("Email: ", "").trim();
+      else if (line.startsWith("Company: ")) result.company_name = line.replace("Company: ", "").trim();
+      else if (line.startsWith("Location: ")) result.location_name = line.replace("Location: ", "").trim();
+      else if (line.startsWith("PO Number: ")) result.po_number = line.replace("PO Number: ", "").trim();
+      else if (line.startsWith("Site Contact: ")) result.contact_name = line.replace("Site Contact: ", "").trim();
+      else if (line.startsWith("Site Contact Phone: ")) result.contact_phone = line.replace("Site Contact Phone: ", "").trim();
+      else if (line.startsWith("PO File: ")) result.po_file_url = line.replace("PO File: ", "").trim();
+      continue;
+    }
+
+    result.raw_lines.push(line);
+  }
+
+  result.note = result.raw_lines.join("\n");
+
+  if (
+    !result.note &&
+    !result.po_number &&
+    !result.contact_name &&
+    !result.contact_phone &&
+    !result.po_file_url &&
+    !result.company_name &&
+    !result.location_name &&
+    !result.customer_email
+  ) {
+    return null;
+  }
+
+  return result;
+}
+
 // ---------- routes ----------
 app.get("/health", (req, res) => json(res, 200, { ok: true, ts: nowIso() }));
 
@@ -213,6 +296,115 @@ app.get("/proxy-ping/proxy", (req, res) =>
     ts: nowIso(),
   })
 );
+
+// Temporary helper: register webhook once, then you can remove this route later.
+app.get("/register-orders-create-webhook", async (req, res) => {
+  try {
+    const mutation = `
+      mutation webhookSubscriptionCreate($topic: WebhookSubscriptionTopic!, $subscription: WebhookSubscriptionInput!) {
+        webhookSubscriptionCreate(topic: $topic, webhookSubscription: $subscription) {
+          webhookSubscription {
+            id
+            topic
+            endpoint {
+              __typename
+            }
+          }
+          userErrors {
+            field
+            message
+          }
+        }
+      }
+    `;
+
+    const callbackUrl = `https://${req.get("host")}/webhooks/orders-create`;
+
+    const result = await shopifyGql(mutation, {
+      topic: "ORDERS_CREATE",
+      subscription: {
+        callbackUrl,
+        format: "JSON",
+      },
+    });
+
+    return json(res, 200, { ok: true, callbackUrl, result });
+  } catch (e) {
+    console.error("Webhook registration failed:", e);
+    return json(res, 500, { ok: false, error: e.message || "Webhook registration failed" });
+  }
+});
+
+// Shopify orders/create webhook
+app.post("/webhooks/orders-create", express.raw({ type: "application/json" }), async (req, res) => {
+  try {
+    const hmacHeader = req.get("X-Shopify-Hmac-SHA256") || "";
+    const rawBody = req.body;
+
+    if (!verifyWebhookHmac(rawBody, hmacHeader)) {
+      return res.status(401).send("Invalid webhook HMAC");
+    }
+
+    const payload = JSON.parse(rawBody.toString("utf8"));
+    const orderId = payload?.id;
+    const note = (payload?.note || "").toString();
+
+    if (!orderId) {
+      return res.status(200).send("No order id");
+    }
+
+    if (!note.includes("Order Pad Submission")) {
+      return res.status(200).send("Not an order pad order");
+    }
+
+    const orderPadData = extractOrderPadJsonFromNote(note);
+    if (!orderPadData) {
+      return res.status(200).send("No order pad data found");
+    }
+
+    const mutation = `
+      mutation setOrderMetafield($metafields: [MetafieldsSetInput!]!) {
+        metafieldsSet(metafields: $metafields) {
+          metafields {
+            id
+            namespace
+            key
+          }
+          userErrors {
+            field
+            message
+          }
+        }
+      }
+    `;
+
+    const ownerId = orderGidFromNumericId(orderId);
+
+    const result = await shopifyGql(mutation, {
+      metafields: [
+        {
+          ownerId,
+          namespace: "custom",
+          key: "orderpad_items",
+          type: "json",
+          value: JSON.stringify(orderPadData),
+        },
+      ],
+    });
+
+    const errs = result?.metafieldsSet?.userErrors || [];
+    if (errs.length) {
+      console.error("orders-create webhook metafield errors:", errs);
+    } else {
+      console.log("orders-create webhook metafield saved for order", orderId);
+    }
+
+    return res.status(200).send("OK");
+  } catch (e) {
+    console.error("orders-create webhook failed:", e);
+    return res.status(500).send("Server error");
+  }
+});
 
 // Main App Proxy endpoint
 app.all("/proxy", verifyAppProxy, async (req, res) => {
@@ -431,147 +623,150 @@ app.all("/proxy", verifyAppProxy, async (req, res) => {
         });
       }
 
-case "draftpad": {
-  const note = (req.body?.note || "").toString().trim();
-  const companyName = (req.body?.company_name || "").toString().trim();
-  const locationName = (req.body?.location_name || "").toString().trim();
-  const customerEmail = (req.body?.customer_email || "").toString().trim();
+      case "draftpad": {
+        const note = (req.body?.note || "").toString().trim();
+        const companyName = (req.body?.company_name || "").toString().trim();
+        const locationName = (req.body?.location_name || "").toString().trim();
+        const customerEmail = (req.body?.customer_email || "").toString().trim();
 
-  const poNumber = (req.body?.po_number || "").toString().trim();
-  const siteContactName = (req.body?.site_contact_name || "").toString().trim();
-  const siteContactPhone = (req.body?.site_contact_phone || "").toString().trim();
-  const poFileUrl = (req.body?.po_file_url || "").toString().trim();
+        const poNumber = (req.body?.po_number || "").toString().trim();
+        const siteContactName = (req.body?.site_contact_name || "").toString().trim();
+        const siteContactPhone = (req.body?.site_contact_phone || "").toString().trim();
+        const poFileUrl = (req.body?.po_file_url || "").toString().trim();
 
-  const cartItems = safeParseCartItems(req.body?.cart_items);
+        const cartItems = safeParseCartItems(req.body?.cart_items);
 
-  if (!note && (!cartItems || cartItems.length === 0)) {
-    return json(res, 400, { ok: false, error: "Please paste items or add items to cart." });
-  }
+        if (!note && (!cartItems || cartItems.length === 0)) {
+          return json(res, 400, { ok: false, error: "Please paste items or add items to cart." });
+        }
 
-  let header = "Order Pad Submission";
-  header += `\nCustomer ID: ${customerId}`;
-  if (customerEmail) header += `\nEmail: ${customerEmail}`;
-  if (companyName) header += `\nCompany: ${companyName}`;
-  if (locationName) header += `\nLocation: ${locationName}`;
-  if (poNumber) header += `\nPO Number: ${poNumber}`;
-  if (siteContactName) header += `\nSite Contact: ${siteContactName}`;
-  if (siteContactPhone) header += `\nSite Contact Phone: ${siteContactPhone}`;
-  if (poFileUrl) header += `\nPO File: ${poFileUrl}`;
+        let header = "Order Pad Submission";
+        header += `\nCustomer ID: ${customerId}`;
+        if (customerEmail) header += `\nEmail: ${customerEmail}`;
+        if (companyName) header += `\nCompany: ${companyName}`;
+        if (locationName) header += `\nLocation: ${locationName}`;
+        if (poNumber) header += `\nPO Number: ${poNumber}`;
+        if (siteContactName) header += `\nSite Contact: ${siteContactName}`;
+        if (siteContactPhone) header += `\nSite Contact Phone: ${siteContactPhone}`;
+        if (poFileUrl) header += `\nPO File: ${poFileUrl}`;
 
-  const finalNote = (header + (note ? "\n\n---\n" + note : "")).trim();
+        const finalNote = (header + (note ? "\n\n---\n" + note : "")).trim();
 
-  const lineItems = [];
-  if (Array.isArray(cartItems) && cartItems.length) {
-    for (const it of cartItems) {
-      const gid = toVariantGid(it?.variant_id);
-      const qty = Number.parseInt(it?.quantity ?? 1, 10);
-      if (!gid || !Number.isFinite(qty) || qty <= 0) continue;
-      lineItems.push({ variantId: gid, quantity: qty });
-    }
-  }
+        const lineItems = [];
+        if (Array.isArray(cartItems) && cartItems.length) {
+          for (const it of cartItems) {
+            const gid = toVariantGid(it?.variant_id);
+            const qty = Number.parseInt(it?.quantity ?? 1, 10);
+            if (!gid || !Number.isFinite(qty) || qty <= 0) continue;
+            lineItems.push({ variantId: gid, quantity: qty });
+          }
+        }
 
-  if (!lineItems.length) {
-    lineItems.push({
-      title: "Order Pad Submission",
-      quantity: 1,
-      originalUnitPrice: "0.00",
-    });
-  }
+        if (!lineItems.length) {
+          lineItems.push({
+            title: "Order Pad Submission",
+            quantity: 1,
+            originalUnitPrice: "0.00",
+          });
+        }
 
-  const mutation = `
-    mutation DraftOrderCreate($input: DraftOrderInput!) {
-      draftOrderCreate(input: $input) {
-        draftOrder {
-          id
-          name
-          metafields(first: 10) {
-            edges {
-              node {
-                namespace
-                key
-                type
-                value
+        const mutation = `
+          mutation DraftOrderCreate($input: DraftOrderInput!) {
+            draftOrderCreate(input: $input) {
+              draftOrder {
+                id
+                name
+                metafields(first: 10) {
+                  edges {
+                    node {
+                      namespace
+                      key
+                      type
+                      value
+                    }
+                  }
+                }
+              }
+              userErrors {
+                field
+                message
               }
             }
           }
-        }
-        userErrors {
-          field
-          message
+        `;
+
+        const orderPadData = {
+          note,
+          raw_lines: note ? note.split("\n").map((line) => line.trim()).filter(Boolean) : [],
+          cart_items: (cartItems || []).map((it) => ({
+            sku: (it?.sku || it?.variant_sku || "").toString().trim(),
+            title: (it?.product_title || it?.title || "").toString().trim(),
+            quantity: Number(it?.quantity || 1),
+            variant_id: it?.variant_id ? String(it.variant_id) : "",
+          })),
+          po_number: poNumber || "",
+          contact_name: siteContactName || "",
+          contact_phone: siteContactPhone || "",
+          po_file_url: poFileUrl || "",
+          company_name: companyName || "",
+          location_name: locationName || "",
+          customer_email: customerEmail || "",
+          created_at: new Date().toISOString(),
+        };
+
+        const input = {
+          customerId: customerGidFromNumericId(customerId),
+          ...(customerEmail ? { email: customerEmail } : {}),
+          note: finalNote,
+          lineItems,
+          metafields: [
+            {
+              namespace: "custom",
+              key: "orderpad_items",
+              type: "json",
+              value: JSON.stringify(orderPadData),
+            },
+          ],
+        };
+
+        console.log("ORDERPAD DATA:", JSON.stringify(orderPadData, null, 2));
+        console.log("INPUT METAFIELDS:", JSON.stringify(input.metafields, null, 2));
+
+        try {
+          const data = await shopifyGql(mutation, { input });
+          const out = data?.draftOrderCreate;
+          const userErrors = out?.userErrors || [];
+
+          console.log("draftOrderCreate userErrors:", JSON.stringify(userErrors, null, 2));
+          console.log(
+            "draftOrderCreate metafields:",
+            JSON.stringify(out?.draftOrder?.metafields?.edges || [], null, 2)
+          );
+
+          if (userErrors.length) {
+            return json(res, 200, {
+              ok: false,
+              error: userErrors.map((e) => e.message).join(" | "),
+            });
+          }
+
+          if (!out?.draftOrder?.id) {
+            return json(res, 200, { ok: false, error: "Draft order not created" });
+          }
+
+          return json(res, 200, {
+            ok: true,
+            draft_order_id: out.draftOrder.id,
+            draft_order_name: out.draftOrder.name || null,
+          });
+        } catch (e) {
+          console.error("draftpad failed:", e);
+          return json(res, 200, { ok: false, error: e.message || "Draft order not created" });
         }
       }
-    }
-  `;
 
-  const orderPadData = {
-    note,
-    raw_lines: note ? note.split("\n").map((line) => line.trim()).filter(Boolean) : [],
-    cart_items: (cartItems || []).map((it) => ({
-      sku: (it?.sku || it?.variant_sku || "").toString().trim(),
-      title: (it?.product_title || it?.title || "").toString().trim(),
-      quantity: Number(it?.quantity || 1),
-      variant_id: it?.variant_id ? String(it.variant_id) : "",
-    })),
-    po_number: poNumber || "",
-    contact_name: siteContactName || "",
-    contact_phone: siteContactPhone || "",
-    po_file_url: poFileUrl || "",
-    company_name: companyName || "",
-    location_name: locationName || "",
-    customer_email: customerEmail || "",
-    created_at: new Date().toISOString(),
-  };
-
-  const input = {
-    customerId: customerGidFromNumericId(customerId),
-    ...(customerEmail ? { email: customerEmail } : {}),
-    note: finalNote,
-    lineItems,
-    metafields: [
-      {
-        namespace: "custom",
-        key: "orderpad_items",
-        type: "json",
-        value: JSON.stringify(orderPadData),
-      },
-    ],
-  };
-
-  console.log("ORDERPAD DATA:", JSON.stringify(orderPadData, null, 2));
-  console.log("INPUT METAFIELDS:", JSON.stringify(input.metafields, null, 2));
-
-  try {
-    const data = await shopifyGql(mutation, { input });
-    const out = data?.draftOrderCreate;
-    const userErrors = out?.userErrors || [];
-
-    console.log("draftOrderCreate userErrors:", JSON.stringify(userErrors, null, 2));
-    console.log("draftOrderCreate metafields:", JSON.stringify(out?.draftOrder?.metafields?.edges || [], null, 2));
-
-    if (userErrors.length) {
-      return json(res, 200, {
-        ok: false,
-        error: userErrors.map((e) => e.message).join(" | "),
-      });
-    }
-
-    if (!out?.draftOrder?.id) {
-      return json(res, 200, { ok: false, error: "Draft order not created" });
-    }
-
-    return json(res, 200, {
-      ok: true,
-      draft_order_id: out.draftOrder.id,
-      draft_order_name: out.draftOrder.name || null,
-    });
-  } catch (e) {
-    console.error("draftpad failed:", e);
-    return json(res, 200, { ok: false, error: e.message || "Draft order not created" });
-  }
-}
-
-default:
-  return json(res, 400, { ok: false, error: "Unsupported action" });
+      default:
+        return json(res, 400, { ok: false, error: "Unsupported action" });
     }
   } catch (e) {
     console.error("Proxy handler error:", e);
