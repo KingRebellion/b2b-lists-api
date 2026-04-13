@@ -338,7 +338,7 @@ app.get("/register-orders-create-webhook", async (req, res) => {
 });
 
 // Shopify orders/create webhook
-app.post("/webhooks/orders-create", express.raw({ type: "*/*" }), async (req, res) => {
+app.post("/webhooks/orders-create", express.raw({ type: "application/json" }), async (req, res) => {
   try {
     console.log("orders-create webhook hit");
     console.log("orders-create webhook topic:", req.get("X-Shopify-Topic"));
