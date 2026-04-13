@@ -7,8 +7,8 @@
 // ENV required:
 //   DATABASE_URL
 //   SHOPIFY_APP_SECRET
-//   SHOPIFY_STORE_DOMAIN          (e.g. mississauga-hardware-wholesale.myshopify.com)
-//   SHOPIFY_ADMIN_ACCESS_TOKEN    (Admin API access token)
+//   SHOPIFY_STORE_DOMAIN
+//   SHOPIFY_ADMIN_ACCESS_TOKEN
 //
 // Optional:
 //   PORT (default 3000)
@@ -20,22 +20,7 @@ import pg from "pg";
 const { Pool } = pg;
 
 const app = express();
-app.use((req, res, next) => {
-  if (req.originalUrl.startsWith("/webhooks")) {
-    let data = [];
-    req.on("data", chunk => data.push(chunk));
-    req.on("end", () => {
-      req.rawBody = Buffer.concat(data);
-      next();
-    });
-  } else {
-    next();
-  }
-});
 app.set("trust proxy", 1);
-
-// IMPORTANT: App Proxy often breaks with JSON bodies; keep urlencoded enabled.
-app.use(express.urlencoded({ extended: false }));
 
 const PORT = process.env.PORT || 3000;
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -52,39 +37,6 @@ const pool = new Pool({
   connectionString: DATABASE_URL,
   ssl: process.env.NODE_ENV === "production" ? { rejectUnauthorized: false } : false,
 });
-
-// ---------- DB init (safe, idempotent) ----------
-async function ensureSchema() {
-  try {
-    await pool.query(`CREATE EXTENSION IF NOT EXISTS pgcrypto;`);
-  } catch (e) {}
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS lists (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      customer_id BIGINT NOT NULL,
-      name TEXT NOT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-  `);
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS list_items (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      list_id UUID NOT NULL REFERENCES lists(id) ON DELETE CASCADE,
-      sku TEXT NOT NULL,
-      quantity INT NOT NULL DEFAULT 1,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-  `);
-
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_lists_customer_id ON lists(customer_id);`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_list_items_list_id ON list_items(list_id);`);
-}
-
-ensureSchema().catch((e) => console.error("Schema init failed:", e));
 
 // ---------- helpers ----------
 function json(res, status, obj) {
@@ -149,7 +101,6 @@ function toVariantGid(variantId) {
   return `gid://shopify/ProductVariant/${n}`;
 }
 
-// ---------- Shopify Admin GraphQL ----------
 async function shopifyGql(query, variables = {}) {
   if (!SHOPIFY_STORE_DOMAIN || !SHOPIFY_ADMIN_ACCESS_TOKEN) {
     throw new Error("Missing SHOPIFY_STORE_DOMAIN or SHOPIFY_ADMIN_ACCESS_TOKEN");
@@ -188,7 +139,6 @@ async function shopifyGql(query, variables = {}) {
   return data.data;
 }
 
-// ---------- Shopify App Proxy signature verification ----------
 function verifyAppProxy(req, res, next) {
   try {
     if (!SHOPIFY_APP_SECRET) return next();
@@ -219,7 +169,6 @@ function verifyAppProxy(req, res, next) {
   }
 }
 
-// ---------- Shopify Webhook verification ----------
 function verifyWebhookHmac(rawBody, hmacHeader) {
   if (!SHOPIFY_APP_SECRET || !rawBody || !hmacHeader) return false;
 
@@ -228,11 +177,13 @@ function verifyWebhookHmac(rawBody, hmacHeader) {
     .update(rawBody)
     .digest("base64");
 
-  return crypto.timingSafeEqual(
-    Buffer.from(digest),
-    Buffer.from(hmacHeader)
-  );
+  const a = Buffer.from(digest, "utf8");
+  const b = Buffer.from(hmacHeader, "utf8");
+  if (a.length !== b.length) return false;
+
+  return crypto.timingSafeEqual(a, b);
 }
+
 function extractOrderPadJsonFromNote(note) {
   if (!note) return null;
 
@@ -294,6 +245,116 @@ function extractOrderPadJsonFromNote(note) {
   return result;
 }
 
+// ---------- Webhook route FIRST ----------
+app.post("/webhooks/orders-create", express.raw({ type: "application/json" }), async (req, res) => {
+  try {
+    console.log("orders-create webhook hit");
+    console.log("orders-create webhook topic:", req.get("X-Shopify-Topic"));
+    console.log("orders-create webhook shop:", req.get("X-Shopify-Shop-Domain"));
+
+    const hmacHeader = req.get("X-Shopify-Hmac-SHA256") || "";
+    const rawBody = req.body;
+
+    if (!verifyWebhookHmac(rawBody, hmacHeader)) {
+      console.error("orders-create webhook invalid HMAC");
+      return res.status(401).send("Invalid HMAC");
+    }
+
+    const payload = JSON.parse(rawBody.toString("utf8"));
+    const orderId = payload?.id;
+    const note = (payload?.note || "").toString();
+
+    if (!orderId) {
+      return res.status(200).send("No order id");
+    }
+
+    if (!note.includes("Order Pad Submission")) {
+      return res.status(200).send("Not an order pad order");
+    }
+
+    const orderPadData = extractOrderPadJsonFromNote(note);
+    if (!orderPadData) {
+      return res.status(200).send("No order pad data found");
+    }
+
+    const mutation = `
+      mutation setOrderMetafield($metafields: [MetafieldsSetInput!]!) {
+        metafieldsSet(metafields: $metafields) {
+          metafields {
+            id
+            namespace
+            key
+          }
+          userErrors {
+            field
+            message
+          }
+        }
+      }
+    `;
+
+    const result = await shopifyGql(mutation, {
+      metafields: [
+        {
+          ownerId: orderGidFromNumericId(orderId),
+          namespace: "custom",
+          key: "orderpad_items",
+          type: "json",
+          value: JSON.stringify(orderPadData),
+        },
+      ],
+    });
+
+    const errs = result?.metafieldsSet?.userErrors || [];
+    if (errs.length) {
+      console.error("orders-create webhook metafield errors:", errs);
+    } else {
+      console.log("orders-create webhook metafield saved for order", orderId);
+    }
+
+    return res.status(200).send("OK");
+  } catch (e) {
+    console.error("orders-create webhook failed:", e);
+    return res.status(500).send("Server error");
+  }
+});
+
+// IMPORTANT: App Proxy often breaks with JSON bodies; keep urlencoded enabled.
+app.use(express.urlencoded({ extended: false }));
+
+// ---------- DB init ----------
+async function ensureSchema() {
+  try {
+    await pool.query(`CREATE EXTENSION IF NOT EXISTS pgcrypto;`);
+  } catch (e) {}
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS lists (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      customer_id BIGINT NOT NULL,
+      name TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS list_items (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      list_id UUID NOT NULL REFERENCES lists(id) ON DELETE CASCADE,
+      sku TEXT NOT NULL,
+      quantity INT NOT NULL DEFAULT 1,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_lists_customer_id ON lists(customer_id);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_list_items_list_id ON list_items(list_id);`);
+}
+
+ensureSchema().catch((e) => console.error("Schema init failed:", e));
+
 // ---------- routes ----------
 app.get("/health", (req, res) => json(res, 200, { ok: true, ts: nowIso() }));
 
@@ -307,7 +368,6 @@ app.get("/proxy-ping/proxy", (req, res) =>
   })
 );
 
-// Temporary helper: register webhook once, then you can remove this route later.
 app.get("/register-orders-create-webhook", async (req, res) => {
   try {
     const mutation = `
@@ -345,77 +405,7 @@ app.get("/register-orders-create-webhook", async (req, res) => {
   }
 });
 
-// Shopify orders/create webhook
-app.post("/webhooks/orders-create", async (req, res) => {
-  try {
-    console.log("orders-create webhook hit");
-
-    const hmacHeader = req.get("X-Shopify-Hmac-SHA256");
-
-    if (!verifyWebhookHmac(req.rawBody, hmacHeader)) {
-      console.error("orders-create webhook invalid HMAC");
-      return res.status(401).send("Invalid HMAC");
-    }
-
-    const payload = JSON.parse(req.rawBody.toString("utf8"));
-
-    if (!orderId) {
-      return res.status(200).send("No order id");
-    }
-
-    if (!note.includes("Order Pad Submission")) {
-      return res.status(200).send("Not an order pad order");
-    }
-
-    const orderPadData = extractOrderPadJsonFromNote(note);
-    if (!orderPadData) {
-      return res.status(200).send("No order pad data found");
-    }
-
-    const mutation = `
-      mutation setOrderMetafield($metafields: [MetafieldsSetInput!]!) {
-        metafieldsSet(metafields: $metafields) {
-          metafields {
-            id
-            namespace
-            key
-          }
-          userErrors {
-            field
-            message
-          }
-        }
-      }
-    `;
-
-    const ownerId = orderGidFromNumericId(orderId);
-
-    const result = await shopifyGql(mutation, {
-      metafields: [
-        {
-          ownerId,
-          namespace: "custom",
-          key: "orderpad_items",
-          type: "json",
-          value: JSON.stringify(orderPadData),
-        },
-      ],
-    });
-
-    const errs = result?.metafieldsSet?.userErrors || [];
-    if (errs.length) {
-      console.error("orders-create webhook metafield errors:", errs);
-    } else {
-      console.log("orders-create webhook metafield saved for order", orderId);
-    }
-
-    return res.status(200).send("OK");
-  } catch (e) {
-    console.error("orders-create webhook failed:", e);
-    return res.status(500).send("Server error");
-  }
-});
-// Main App Proxy endpoint
+// ---------- Main App Proxy endpoint ----------
 app.all("/proxy", verifyAppProxy, async (req, res) => {
   try {
     const action = (req.query.action || req.query.actions || "").toString().trim();
